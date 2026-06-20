@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "sprout_ui",
+    "sprout_ui_core",
+    "sprout_ui_tags",
+    "sprout_ui_components",
+]
+resolver = "2"

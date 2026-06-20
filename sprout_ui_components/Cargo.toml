@@ -1,0 +1,8 @@
+[package]
+name = "sprout_ui_components"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sprout_ui_core = { path = "../sprout_ui_core" }
+sprout_ui_tags = { path = "../sprout_ui_tags" }
