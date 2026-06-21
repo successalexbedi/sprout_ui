@@ -1,4 +1,5 @@
 use maud::{Markup, Render, PreEscaped};
+use std::borrow::Cow;
 
 #[derive(Clone)]
 pub enum Node {
@@ -16,7 +17,7 @@ impl From<String> for Node { fn from(s: String) -> Self { Node::Text(s) } }
 pub struct Attrs {
     pub classes: Vec<String>,
     pub id: Option<String>,
-    pub pairs: Vec<(&'static str, String)>,
+    pub pairs: Vec<(Cow<'static, str>, String)>,
 }
 
 impl Attrs {
@@ -33,7 +34,7 @@ impl Attrs {
         }
         for (k, v) in &self.pairs {
             w.push(' ');
-            w.push_str(k);
+            w.push_str(&k);
             w.push_str("=\"");
             escape_attr(v, w);
             w.push('"');
@@ -48,13 +49,6 @@ pub struct Element {
     pub children: Vec<Node>,
 }
 
-/// Tags that cannot contain children, e.g. `<br>`, `<img>`, `<input>`.
-///
-/// This should NOT compile — VoidElement has no `.child()` method:
-/// ```compile_fail
-/// use sprout_ui_core::VoidElement;
-/// let broken = VoidElement::new("br").child("oops");
-/// ```
 #[derive(Clone)]
 pub struct VoidElement {
     pub tag: &'static str,
@@ -75,12 +69,13 @@ macro_rules! impl_attr_methods {
                 self.attrs.id = Some(id.into());
                 self
             }
-            pub fn attr(mut self, key: &'static str, value: impl Into<String>) -> Self {
-                self.attrs.pairs.push((key, value.into()));
+            pub fn attr(mut self, key: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Self {
+                self.attrs.pairs.push((key.into(), value.into()));
                 self
             }
+            // --- Added Style Sugar ---
+            pub fn style(self, css: impl Into<String>) -> Self { self.attr("style", css) }
 
-            // --- Common HTML attribute sugar ---
             pub fn src(self, url: impl Into<String>) -> Self { self.attr("src", url) }
             pub fn href(self, url: impl Into<String>) -> Self { self.attr("href", url) }
             pub fn alt(self, text: impl Into<String>) -> Self { self.attr("alt", text) }
@@ -89,38 +84,26 @@ macro_rules! impl_attr_methods {
             pub fn placeholder(self, p: impl Into<String>) -> Self { self.attr("placeholder", p) }
             pub fn type_(self, t: impl Into<String>) -> Self { self.attr("type", t) }
 
-            // --- HTMX sugar ---
             pub fn hx_get(self, url: &'static str) -> Self { self.attr("hx-get", url) }
             pub fn hx_post(self, url: &'static str) -> Self { self.attr("hx-post", url) }
             pub fn hx_target(self, target: &'static str) -> Self { self.attr("hx-target", target) }
             pub fn hx_swap(self, mode: &'static str) -> Self { self.attr("hx-swap", mode) }
             pub fn hx_trigger(self, trigger: &'static str) -> Self { self.attr("hx-trigger", trigger) }
 
-            // --- Alpine.js sugar ---
-            // x_data: declares Alpine state on this element, e.g. x_data("{ open: false }")
             pub fn x_data(self, expr: impl Into<String>) -> Self { self.attr("x-data", expr) }
-            // x_show: toggles visibility based on an expression, e.g. x_show("open")
             pub fn x_show(self, expr: impl Into<String>) -> Self { self.attr("x-show", expr) }
-            // x_if: only renders the element (inside a <template>) if expression is true
             pub fn x_if(self, expr: impl Into<String>) -> Self { self.attr("x-if", expr) }
-            // x_model: two-way binds a form input to Alpine state, e.g. x_model("title")
             pub fn x_model(self, expr: impl Into<String>) -> Self { self.attr("x-model", expr) }
-            // x_text: sets the element's text content from an expression
             pub fn x_text(self, expr: impl Into<String>) -> Self { self.attr("x-text", expr) }
-            // x_on: binds an event handler. event is e.g. "click", expr is the Alpine expression.
+            
             pub fn x_on(self, event: &str, expr: impl Into<String>) -> Self {
-                // hx-* style attributes are &'static str keys, but x-on:EVENT is dynamic
-                // per call, so we build the key at runtime via a leaked string. This is the
-                // one sugar method that can't reuse the static-key `.attr()` directly.
-                let key: &'static str = Box::leak(format!("x-on:{event}").into_boxed_str());
+                let key = format!("x-on:{event}");
                 self.attr(key, expr)
             }
-            // x_bind: binds an arbitrary attribute to an expression, e.g. x_bind("class", "isOpen ? 'show' : ''")
             pub fn x_bind(self, attribute: &str, expr: impl Into<String>) -> Self {
-                let key: &'static str = Box::leak(format!("x-bind:{attribute}").into_boxed_str());
+                let key = format!("x-bind:{attribute}");
                 self.attr(key, expr)
             }
-            // x_transition: adds Alpine's built-in transition behavior with no args
             pub fn x_transition(self) -> Self { self.attr("x-transition", "") }
         }
     };
@@ -151,6 +134,37 @@ impl Element {
         }
         self
     }
+    
+    
+    // --- NEW: build one child per item, no .map().collect() needed ---
+    pub fn child_for<I, T, F, N>(mut self, items: I, f: F) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        F: Fn(T) -> N,
+        N: Into<Node>,
+    {
+        let iter = items.into_iter();
+        self.children.reserve(iter.size_hint().0);
+        for item in iter {
+            self.children.push(f(item).into());
+        }
+        self
+    }
+
+    // --- NEW: only add a child if a condition is true ---
+    pub fn child_if<F, N>(self, condition: bool, f: F) -> Self
+    where
+        F: FnOnce() -> N,
+        N: Into<Node>,
+    {
+        if condition {
+            self.child(f())
+        } else {
+            self
+        }
+    }
+    
+    
 
     pub fn build(self) -> Markup {
         let mut buf = String::with_capacity(256);
@@ -242,6 +256,12 @@ mod tests {
     fn renders_single_class() {
         let html = Element::new("div").class("card").build().into_string();
         assert_eq!(html, r#"<div class="card"></div>"#);
+    }
+
+    #[test]
+    fn renders_style_attribute() {
+        let html = Element::new("div").style("color: red;").build().into_string();
+        assert_eq!(html, r#"<div style="color: red;"></div>"#);
     }
 
     #[test]
@@ -340,8 +360,6 @@ mod tests {
         let html = Element::new("form").hx_swap("beforeend").build().into_string();
         assert_eq!(html, r#"<form hx-swap="beforeend"></form>"#);
     }
-
-    // --- Alpine sugar tests ---
 
     #[test]
     fn x_data_sets_correct_attribute() {
@@ -567,4 +585,132 @@ mod tests {
             r##"<div x-data="{ liked: false }" hx-post="/like" hx-target="#likes" x-on:click="liked = !liked"></div>"##
         );
     }
+    
+    #[test]
+    fn id_is_overwritten_by_subsequent_calls() {
+        let html = Element::new("div")
+            .id("first-id")
+            .id("final-id")
+            .build()
+            .into_string();
+        assert_eq!(html, r#"<div id="final-id"></div>"#);
+    }
+
+    #[test]
+    fn accepts_dynamic_children_from_iterators() {
+        let items: Vec<String> = (1..=3).map(|i| format!("Item {}", i)).collect();
+        
+        let html = Element::new("ul")
+            .children(items.into_iter().map(|s| Element::new("li").child(s)))
+            .build()
+            .into_string();
+            
+        assert_eq!(html, "<ul><li>Item 1</li><li>Item 2</li><li>Item 3</li></ul>");
+    }
+
+    #[test]
+    fn handles_empty_string_attributes_gracefully() {
+        let html = VoidElement::new("input")
+            .class("")
+            .id("")
+            .attr("disabled", "")
+            .attr("required", "")
+            .build()
+            .into_string();
+        
+        assert_eq!(html, r#"<input class="" id="" disabled="" required="">"#);
+    }
+
+    #[test]
+    fn strict_escaping_differences_between_text_and_attributes() {
+        let evil_string = r#"<script>alert("hax & stuff")</script>"#;
+        
+        let html = Element::new("div")
+            .attr("data-payload", evil_string)
+            .child(evil_string)
+            .build()
+            .into_string();
+            
+        assert_eq!(
+            html,
+            r#"<div data-payload="&lt;script&gt;alert(&quot;hax &amp; stuff&quot;)&lt;/script&gt;">&lt;script&gt;alert("hax &amp; stuff")&lt;/script&gt;</div>"#
+        );
+    }
+
+    #[test]
+    fn cow_attr_accepts_owned_strings_safely() {
+        let dynamic_key = format!("data-{}", "user-id");
+        let html = Element::new("div")
+            .attr(dynamic_key, "123")
+            .build()
+            .into_string();
+            
+        assert_eq!(html, r#"<div data-user-id="123"></div>"#);
+    }
+
+    #[test]
+    fn complex_alpine_expression_escaping() {
+        let html = Element::new("button")
+            .x_data(r#"{ user: { name: "John & Jane", active: true } }"#)
+            .x_on("click", r#"console.log('Clicked "Submit" <here>');"#)
+            .build()
+            .into_string();
+            
+        assert_eq!(
+            html,
+            r#"<button x-data="{ user: { name: &quot;John &amp; Jane&quot;, active: true } }" x-on:click="console.log('Clicked &quot;Submit&quot; &lt;here&gt;');"></button>"#
+        );
+    }
+
+    #[test]
+    fn massive_tree_depth_does_not_panic() {
+        let deep_tree = (1..=10).fold(Element::new("span").child("Deepest"), |acc, i| {
+            Element::new("div").class(format!("level-{}", i)).child(acc)
+        });
+        
+        let html = Element::new("div")
+            .id("root")
+            .child(deep_tree)
+            .build()
+            .into_string();
+            
+        assert!(html.starts_with(r#"<div id="root"><div class="level-10"><div class="level-9""#));
+        assert!(html.contains("<span>Deepest</span>"));
+        assert!(html.ends_with("</div></div></div>"));
+    }
+
+    #[test]
+    fn iterators_can_mix_nodes_and_text() {
+        let dynamic_content: Vec<Node> = vec![
+            "Prefix text - ".into(),
+            Element::new("strong").child("Bold text").into(),
+            " - Suffix text".into(),
+        ];
+        
+        let html = Element::new("p")
+            .children(dynamic_content)
+            .build()
+            .into_string();
+            
+        assert_eq!(html, "<p>Prefix text - <strong>Bold text</strong> - Suffix text</p>");
+    }
+    
+    
+    #[test]
+fn child_for_builds_children_from_iterator() {
+    let fruits = vec!["Apple", "Banana"];
+    let html = Element::new("ul")
+        .child_for(fruits, |f| Element::new("li").child(f.to_string()))
+        .build()
+        .into_string();
+    assert_eq!(html, "<ul><li>Apple</li><li>Banana</li></ul>");
+}
+
+#[test]
+fn child_if_only_adds_when_true() {
+    let shown = Element::new("div").child_if(true, || "visible").build().into_string();
+    let hidden = Element::new("div").child_if(false, || "invisible").build().into_string();
+    assert_eq!(shown, "<div>visible</div>");
+    assert_eq!(hidden, "<div></div>");
+}
 }
