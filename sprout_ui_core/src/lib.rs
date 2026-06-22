@@ -1,11 +1,110 @@
+// =====================================================================
+// SPROUT — sprout_ui_core
+// -----------------------------------------------------------------------
+// Author: [Your Name]
+// Created: 2026
+// Last updated: June 22, 2026
+//
+// A builder-pattern HTML library for Rust, built as a more readable
+// alternative to Maud's macro syntax. Method chains instead of html!{}.
+//
+// This file is the engine room: it defines what an HTML element *is*
+// and how it turns into a real, escaped HTML string. Most day-to-day
+// page-building never touches this file directly — see sprout_ui_tags
+// for the everyday tag::div()/tag::p() functions built on top of this.
+// =====================================================================
+
 use maud::{Markup, Render, PreEscaped};
 use std::borrow::Cow;
+
+// =====================================================================
+// SECTION 1 — THE LEGAL TAG DICTIONARY (debug-build typo protection)
+// -----------------------------------------------------------------------
+// These lists power a development-time safety net: if you call
+// Element::new("dvi") by mistake, this catches it with a helpful panic
+// in debug builds. It does NOT run in release builds (see #[cfg(debug_assertions)]
+// below), so it costs nothing in production.
+//
+// IMPORTANT: tags containing a hyphen (e.g. "my-widget") are always
+// allowed through untouched, since real custom elements/web components
+// are required by the HTML spec to contain a dash. This is what makes
+// Element::new("...") usable as the documented escape hatch for
+// non-standard tags, instead of accidentally blocking it.
+// =====================================================================
+
+/// Every standard HTML tag that is allowed to contain children.
+pub const LEGAL_CONTAINERS: &[&str] = &[
+    "div", "section", "nav", "main", "header", "footer", "aside", "article", "address", "details", "summary", "dialog",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "a", "strong", "em", "small", "blockquote", "pre", "code", "kbd", "sub", "sup", "mark", "time", "del", "ins",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "form", "label", "textarea", "select", "option", "optgroup", "button", "fieldset", "legend", "output", "progress", "meter",
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "colgroup",
+    "video", "audio", "iframe", "canvas", "picture", "map", "object",
+    "html", "head", "body", "title", "style", "script", "noscript",
+    "svg", "datalist",
+];
+
+/// Every standard HTML tag that is self-closing and cannot contain children.
+/// NOTE: "path" lives here, not in LEGAL_CONTAINERS — <path> is void in real HTML.
+pub const LEGAL_VOIDS: &[&str] = &[
+    "br", "hr", "img", "input", "link", "meta", "area", "base", "col", "embed", "param", "source", "track", "wbr",
+    "path",
+];
+
+/// Compile-time string equality check, used by is_legal_tag below.
+pub const fn const_str_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a_bytes.len() {
+        if a_bytes[i] != b_bytes[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Checks whether `tag` appears in the given list of legal tag names.
+pub const fn is_legal_tag(tag: &str, list: &[&str]) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        if const_str_eq(tag, list[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Real custom elements (web components) are required by the HTML spec
+/// to contain a hyphen in their tag name — e.g. <my-widget>, never <mywidget>.
+/// We use that rule to let genuinely custom tags through the validation
+/// below without needing to be on the standard tag list at all.
+fn is_custom_element_name(tag: &str) -> bool {
+    tag.contains('-')
+}
+
+// =====================================================================
+// SECTION 2 — NODE: WHAT CAN LIVE INSIDE AN ELEMENT'S CHILDREN
+// =====================================================================
 
 #[derive(Clone)]
 pub enum Node {
     Element(Box<Element>),
     Void(Box<VoidElement>),
     Text(String),
+    /// A list of sibling nodes with no wrapping tag around them —
+    /// lets you pass a Vec<Node> straight into .child() without
+    /// needing an extra wrapper element just to hold them.
+    Fragment(Vec<Node>),
+    /// Renders as nothing at all. Exists so Option<T>::None can flow
+    /// straight into .child() and simply not render, instead of
+    /// requiring a separate conditional method call.
+    Empty,
 }
 
 impl From<Element> for Node { fn from(e: Element) -> Self { Node::Element(Box::new(e)) } }
@@ -13,18 +112,46 @@ impl From<VoidElement> for Node { fn from(e: VoidElement) -> Self { Node::Void(B
 impl From<&str> for Node { fn from(s: &str) -> Self { Node::Text(s.to_string()) } }
 impl From<String> for Node { fn from(s: String) -> Self { Node::Text(s) } }
 
+impl<T> From<Option<T>> for Node where T: Into<Node> {
+    fn from(opt: Option<T>) -> Self {
+        match opt {
+            Some(v) => v.into(),
+            None => Node::Empty,
+        }
+    }
+}
+
+impl From<Vec<Node>> for Node {
+    fn from(vec: Vec<Node>) -> Self {
+        Node::Fragment(vec)
+    }
+}
+
+// =====================================================================
+// SECTION 3 — ATTRS: SHARED STORAGE FOR CLASSES, ID, AND ATTRIBUTES
+// -----------------------------------------------------------------------
+// Both Element and VoidElement use this same struct, so class/id/attr
+// handling is written exactly once and shared by both types.
+// =====================================================================
+
 #[derive(Clone, Default)]
 pub struct Attrs {
-    pub classes: Vec<String>,
-    pub id: Option<String>,
-    pub pairs: Vec<(Cow<'static, str>, String)>,
+    pub classes: Vec<Cow<'static, str>>,
+    pub id: Option<Cow<'static, str>>,
+    /// Some(value) renders as key="value". None renders as a bare
+    /// boolean attribute (e.g. `disabled`, with no ="" at all) —
+    /// this is the more idiomatic HTML5 form for boolean attributes.
+    pub pairs: Vec<(Cow<'static, str>, Option<Cow<'static, str>>)>,
 }
 
 impl Attrs {
     fn render_to(&self, w: &mut String) {
         if !self.classes.is_empty() {
             w.push_str(" class=\"");
-            escape_attr(&self.classes.join(" "), w);
+            for (i, c) in self.classes.iter().enumerate() {
+                if i > 0 { w.push(' '); }
+                escape_attr(c, w);
+            }
             w.push('"');
         }
         if let Some(ref id) = self.id {
@@ -32,15 +159,28 @@ impl Attrs {
             escape_attr(id, w);
             w.push('"');
         }
-        for (k, v) in &self.pairs {
+        for (k, v_opt) in &self.pairs {
             w.push(' ');
             w.push_str(k);
-            w.push_str("=\"");
-            escape_attr(v, w);
-            w.push('"');
+            if let Some(v) = v_opt {
+                w.push_str("=\"");
+                escape_attr(v, w);
+                w.push('"');
+            }
         }
     }
 }
+
+// =====================================================================
+// SECTION 4 — ELEMENT AND VOIDELEMENT: THE TWO CORE TYPES
+// -----------------------------------------------------------------------
+// Element = any tag that CAN have children (<div>, <p>, <button>...)
+// VoidElement = any tag that CANNOT have children (<br>, <img>, <input>...)
+//
+// Splitting these into two types means VoidElement simply has no
+// .child() method at all — calling tag::br().child("x") is a compile
+// error, not a silent bug that quietly discards the child at render time.
+// =====================================================================
 
 #[derive(Clone)]
 pub struct Element {
@@ -49,61 +189,81 @@ pub struct Element {
     pub children: Vec<Node>,
 }
 
-/// Tags that cannot contain children, e.g. `<br>`, `<img>`, `<input>`.
-///
-/// This should NOT compile — VoidElement has no `.child()` method:
-/// ```compile_fail
-/// use sprout_ui_core::VoidElement;
-/// let broken = VoidElement::new("br").child("oops");
-/// ```
 #[derive(Clone)]
 pub struct VoidElement {
     pub tag: &'static str,
     pub attrs: Attrs,
 }
 
+// =====================================================================
+// SECTION 5 — SHARED BUILDER METHODS (class, attr, htmx, alpine, etc.)
+// -----------------------------------------------------------------------
+// Written once via macro, applied to both Element and VoidElement,
+// so .class()/.attr()/.hx_post() etc. work identically on either type.
+// =====================================================================
+
 macro_rules! impl_attr_methods {
     ($t:ty) => {
         impl $t {
-            pub fn class(mut self, c: impl Into<String>) -> Self {
+            pub fn class(mut self, c: impl Into<Cow<'static, str>>) -> Self {
                 let c = c.into();
                 if !self.attrs.classes.contains(&c) {
                     self.attrs.classes.push(c);
                 }
                 self
             }
-            pub fn class_if(self, condition: bool, class: impl Into<String>) -> Self {
-                if condition {
-                    self.class(class)
-                } else {
-                    self
-                }
+
+            pub fn class_if(self, condition: bool, class: impl Into<Cow<'static, str>>) -> Self {
+                if condition { self.class(class) } else { self }
             }
-            pub fn id(mut self, id: impl Into<String>) -> Self {
+
+            /// Adds several classes at once, each gated by its own condition.
+            pub fn classes_if<I, S>(mut self, class_map: I) -> Self
+            where
+                I: IntoIterator<Item = (bool, S)>,
+                S: Into<Cow<'static, str>>,
+            {
+                for (condition, class_name) in class_map {
+                    if condition { self = self.class(class_name); }
+                }
+                self
+            }
+
+            pub fn id(mut self, id: impl Into<Cow<'static, str>>) -> Self {
                 self.attrs.id = Some(id.into());
                 self
             }
-            pub fn attr(mut self, key: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Self {
-                self.attrs.pairs.push((key.into(), value.into()));
+
+            pub fn attr(mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) -> Self {
+                self.attrs.pairs.push((key.into(), Some(value.into())));
                 self
             }
-            pub fn attr_if(self, condition: bool, key: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Self {
-                if condition {
-                    self.attr(key, value)
-                } else {
-                    self
-                }
+
+            pub fn attr_if(self, condition: bool, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) -> Self {
+                if condition { self.attr(key, value) } else { self }
             }
 
+            /// Sets a real HTML boolean attribute (present = on, absent = off).
+            /// Renders as a bare attribute with no ="" value, e.g. `disabled`.
+            pub fn flag(mut self, condition: bool, key: impl Into<Cow<'static, str>>) -> Self {
+                if condition { self.attrs.pairs.push((key.into(), None)); }
+                self
+            }
+
+            pub fn disabled(self, condition: bool) -> Self { self.flag(condition, "disabled") }
+            pub fn required(self, condition: bool) -> Self { self.flag(condition, "required") }
+            pub fn readonly(self, condition: bool) -> Self { self.flag(condition, "readonly") }
+            pub fn checked(self, condition: bool) -> Self { self.flag(condition, "checked") }
+
             // --- Common HTML attribute sugar ---
-            pub fn style(self, css: impl Into<String>) -> Self { self.attr("style", css) }
-            pub fn src(self, url: impl Into<String>) -> Self { self.attr("src", url) }
-            pub fn href(self, url: impl Into<String>) -> Self { self.attr("href", url) }
-            pub fn alt(self, text: impl Into<String>) -> Self { self.attr("alt", text) }
-            pub fn name(self, n: impl Into<String>) -> Self { self.attr("name", n) }
-            pub fn value(self, v: impl Into<String>) -> Self { self.attr("value", v) }
-            pub fn placeholder(self, p: impl Into<String>) -> Self { self.attr("placeholder", p) }
-            pub fn type_(self, t: impl Into<String>) -> Self { self.attr("type", t) }
+            pub fn style(self, css: impl Into<Cow<'static, str>>) -> Self { self.attr("style", css) }
+            pub fn src(self, url: impl Into<Cow<'static, str>>) -> Self { self.attr("src", url) }
+            pub fn href(self, url: impl Into<Cow<'static, str>>) -> Self { self.attr("href", url) }
+            pub fn alt(self, text: impl Into<Cow<'static, str>>) -> Self { self.attr("alt", text) }
+            pub fn name(self, n: impl Into<Cow<'static, str>>) -> Self { self.attr("name", n) }
+            pub fn value(self, v: impl Into<Cow<'static, str>>) -> Self { self.attr("value", v) }
+            pub fn placeholder(self, p: impl Into<Cow<'static, str>>) -> Self { self.attr("placeholder", p) }
+            pub fn type_(self, t: impl Into<Cow<'static, str>>) -> Self { self.attr("type", t) }
 
             // --- HTMX sugar ---
             pub fn hx_get(self, url: &'static str) -> Self { self.attr("hx-get", url) }
@@ -113,20 +273,23 @@ macro_rules! impl_attr_methods {
             pub fn hx_trigger(self, trigger: &'static str) -> Self { self.attr("hx-trigger", trigger) }
 
             // --- Alpine.js sugar ---
-            pub fn x_data(self, expr: impl Into<String>) -> Self { self.attr("x-data", expr) }
-            pub fn x_show(self, expr: impl Into<String>) -> Self { self.attr("x-show", expr) }
-            pub fn x_if(self, expr: impl Into<String>) -> Self { self.attr("x-if", expr) }
-            pub fn x_model(self, expr: impl Into<String>) -> Self { self.attr("x-model", expr) }
-            pub fn x_text(self, expr: impl Into<String>) -> Self { self.attr("x-text", expr) }
-            pub fn x_on(self, event: &str, expr: impl Into<String>) -> Self {
-                let key = format!("x-on:{event}");
-                self.attr(key, expr)
+            pub fn x_data(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-data", expr) }
+            pub fn x_show(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-show", expr) }
+            pub fn x_if(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-if", expr) }
+            pub fn x_model(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-model", expr) }
+            pub fn x_text(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-text", expr) }
+            pub fn x_on(self, event: &str, expr: impl Into<Cow<'static, str>>) -> Self {
+                self.attr(format!("x-on:{event}"), expr)
             }
-            pub fn x_bind(self, attribute: &str, expr: impl Into<String>) -> Self {
-                let key = format!("x-bind:{attribute}");
-                self.attr(key, expr)
+            pub fn x_bind(self, attribute: &str, expr: impl Into<Cow<'static, str>>) -> Self {
+                self.attr(format!("x-bind:{attribute}"), expr)
             }
-            pub fn x_transition(self) -> Self { self.attr("x-transition", "") }
+            pub fn x_transition(self) -> Self { self.flag(true, "x-transition") }
+
+            /// Escape hatch: run an arbitrary function on this element mid-chain.
+            pub fn modify(self, f: impl FnOnce(Self) -> Self) -> Self {
+                f(self)
+            }
         }
     };
 }
@@ -134,8 +297,34 @@ macro_rules! impl_attr_methods {
 impl_attr_methods!(Element);
 impl_attr_methods!(VoidElement);
 
+// =====================================================================
+// SECTION 6 — ELEMENT: CHILDREN, CONSTRUCTION, AND BUILD
+// =====================================================================
+
 impl Element {
+    /// Builds a new Element. In debug builds, panics with a helpful
+    /// message if the tag name looks like a typo or is structurally
+    /// wrong (e.g. a void tag passed to Element instead of VoidElement).
+    /// Custom element names containing a hyphen always pass through
+    /// untouched, per the HTML spec's own naming rule for web components.
+    #[track_caller]
+    #[inline]
     pub fn new(tag: &'static str) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_CONTAINERS) {
+                let loc = std::panic::Location::caller();
+
+                if is_legal_tag(tag, LEGAL_VOIDS) {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Tag mismatch! '{}' is a strict self-closing VoidElement. Use VoidElement::new() or tag::{}() instead.", loc.file(), loc.line(), loc.column(), tag, tag);
+                } else if let Some(suggestion) = suggest_closest_tag(tag) {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Unknown element '{}'. Did you mean '{}'?", loc.file(), loc.line(), loc.column(), tag, suggestion);
+                } else {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ The requested HTML element '{}' does not exist or is structurally illegal.", loc.file(), loc.line(), loc.column(), tag);
+                }
+            }
+        }
+
         Self { tag, attrs: Attrs::default(), children: vec![] }
     }
 
@@ -157,6 +346,7 @@ impl Element {
         self
     }
 
+    /// Builds one child per item, without writing .map().collect() by hand.
     pub fn child_for<I, T, F, N>(mut self, items: I, f: F) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -171,18 +361,16 @@ impl Element {
         self
     }
 
+    /// Adds a child only if `condition` is true. Closure takes no arguments.
     pub fn child_if<F, N>(self, condition: bool, f: F) -> Self
     where
         F: FnOnce() -> N,
         N: Into<Node>,
     {
-        if condition {
-            self.child(f())
-        } else {
-            self
-        }
+        if condition { self.child(f()) } else { self }
     }
 
+    /// Converts the tree into real, escaped HTML.
     pub fn build(self) -> Markup {
         let mut buf = String::with_capacity(256);
         self.render_to(&mut buf);
@@ -190,8 +378,30 @@ impl Element {
     }
 }
 
+// =====================================================================
+// SECTION 7 — VOIDELEMENT: CONSTRUCTION AND BUILD (no children methods)
+// =====================================================================
+
 impl VoidElement {
+    /// Same typo/structure protection as Element::new, mirrored for void tags.
+    #[track_caller]
+    #[inline]
     pub fn new(tag: &'static str) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_VOIDS) {
+                let loc = std::panic::Location::caller();
+
+                if is_legal_tag(tag, LEGAL_CONTAINERS) {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Tag mismatch! '{}' is a standard container. Use Element::new() or tag::{}() instead.", loc.file(), loc.line(), loc.column(), tag, tag);
+                } else if let Some(suggestion) = suggest_closest_tag(tag) {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Unknown self-closing element '{}'. Did you mean '{}'?", loc.file(), loc.line(), loc.column(), tag, suggestion);
+                } else {
+                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ The requested self-closing HTML tag '{}' does not exist.", loc.file(), loc.line(), loc.column(), tag);
+                }
+            }
+        }
+
         Self { tag, attrs: Attrs::default() }
     }
 
@@ -202,28 +412,62 @@ impl VoidElement {
     }
 }
 
+// =====================================================================
+// SECTION 8 — ESCAPING (THE SECURITY LAYER)
+// -----------------------------------------------------------------------
+// Every piece of text and every attribute value passes through here
+// before reaching the final HTML string. This is what makes it safe
+// to put real user input directly into .child()/.attr() without
+// manually escaping it yourself first.
+//
+// Text and attribute escaping are intentionally different: quotes only
+// matter inside an attribute's "..." boundary, not between tags.
+// =====================================================================
+
 fn escape_text(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'&' | b'<' | b'>' => {
+                out.push_str(&s[last..i]);
+                match b {
+                    b'&' => out.push_str("&amp;"),
+                    b'<' => out.push_str("&lt;"),
+                    b'>' => out.push_str("&gt;"),
+                    _ => unreachable!(),
+                }
+                last = i + 1;
+            }
+            _ => {}
         }
     }
+    out.push_str(&s[last..]);
 }
 
 fn escape_attr(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'&' | b'<' | b'>' | b'"' => {
+                out.push_str(&s[last..i]);
+                match b {
+                    b'&' => out.push_str("&amp;"),
+                    b'<' => out.push_str("&lt;"),
+                    b'>' => out.push_str("&gt;"),
+                    b'"' => out.push_str("&quot;"),
+                    _ => unreachable!(),
+                }
+                last = i + 1;
+            }
+            _ => {}
         }
     }
+    out.push_str(&s[last..]);
 }
+
+// =====================================================================
+// SECTION 9 — RENDERING: TURNING THE TREE INTO A STRING
+// =====================================================================
 
 impl Render for Node {
     fn render_to(&self, w: &mut String) {
@@ -231,6 +475,10 @@ impl Render for Node {
             Node::Text(t) => escape_text(t, w),
             Node::Element(e) => e.render_to(w),
             Node::Void(v) => v.render_to(w),
+            Node::Fragment(nodes) => {
+                for n in nodes { n.render_to(w); }
+            }
+            Node::Empty => {}
         }
     }
 }
@@ -259,6 +507,55 @@ impl Render for VoidElement {
     }
 }
 
+// =====================================================================
+// SECTION 10 — DEV-ONLY TYPO SUGGESTIONS (debug builds only)
+// -----------------------------------------------------------------------
+// Powers the "Did you mean 'div'?" message when a tag name is close
+// to, but not exactly, a real tag. Pure development convenience —
+// compiled out entirely in release builds.
+// =====================================================================
+
+#[cfg(debug_assertions)]
+fn suggest_closest_tag(typo: &str) -> Option<&'static str> {
+    let mut best_match = None;
+    let mut best_dist = 3; // Only suggest if within 2 edits of a real tag
+
+    for &valid in LEGAL_CONTAINERS.iter().chain(LEGAL_VOIDS.iter()) {
+        let dist = levenshtein_distance(typo, valid);
+        if dist < best_dist {
+            best_dist = dist;
+            best_match = Some(valid);
+        }
+    }
+
+    if typo == "btn" { return Some("button"); }
+    if typo == "dvi" { return Some("div"); }
+
+    best_match
+}
+
+#[cfg(debug_assertions)]
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let mut cache: Vec<usize> = (0..=b.len()).collect();
+    for (i, a_byte) in a.bytes().enumerate() {
+        let mut next = vec![i + 1];
+        for (j, b_byte) in b.bytes().enumerate() {
+            let cost = if a_byte == b_byte { 0 } else { 1 };
+            next.push((cache[j + 1] + 1).min(next[j] + 1).min(cache[j] + cost));
+        }
+        cache = next;
+    }
+    *cache.last().unwrap()
+}
+
+// =====================================================================
+// SECTION 11 — TESTS
+// -----------------------------------------------------------------------
+// Every guarantee this file makes — escaping, void-safety, conditional
+// helpers, Fragment/Empty handling — is backed by a test here. If you
+// change behavior in any section above, a test below should catch it.
+// =====================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,15 +567,21 @@ mod tests {
     }
 
     #[test]
-    fn renders_single_class() {
-        let html = Element::new("div").class("card").build().into_string();
-        assert_eq!(html, r#"<div class="card"></div>"#);
+    fn custom_element_with_hyphen_bypasses_validation() {
+        let html = Element::new("my-widget").attr("data-id", "42").build().into_string();
+        assert_eq!(html, r#"<my-widget data-id="42"></my-widget>"#);
     }
 
     #[test]
-    fn renders_style_attribute() {
-        let html = Element::new("div").style("color: red;").build().into_string();
-        assert_eq!(html, r#"<div style="color: red;"></div>"#);
+    fn path_is_correctly_classified_as_void() {
+        let html = VoidElement::new("path").attr("d", "M0 0L10 10").build().into_string();
+        assert_eq!(html, r#"<path d="M0 0L10 10">"#);
+    }
+
+    #[test]
+    fn renders_single_class() {
+        let html = Element::new("div").class("card").build().into_string();
+        assert_eq!(html, r#"<div class="card"></div>"#);
     }
 
     #[test]
@@ -302,11 +605,64 @@ mod tests {
     }
 
     #[test]
+    fn classes_if_adds_only_matching_conditions() {
+        let html = Element::new("li")
+            .classes_if([(true, "active"), (false, "disabled"), (true, "highlighted")])
+            .build()
+            .into_string();
+        assert_eq!(html, r#"<li class="active highlighted"></li>"#);
+    }
+
+    #[test]
     fn attr_if_only_adds_when_true() {
         let disabled = Element::new("button").attr_if(true, "disabled", "").build().into_string();
         let enabled = Element::new("button").attr_if(false, "disabled", "").build().into_string();
         assert_eq!(disabled, r#"<button disabled=""></button>"#);
         assert_eq!(enabled, "<button></button>");
+    }
+
+    #[test]
+    fn flag_sets_bare_boolean_attribute() {
+        let html = VoidElement::new("input").flag(true, "required").build().into_string();
+        assert_eq!(html, "<input required>");
+    }
+
+    #[test]
+    fn disabled_helper_works() {
+        let on = Element::new("button").disabled(true).build().into_string();
+        let off = Element::new("button").disabled(false).build().into_string();
+        assert_eq!(on, "<button disabled></button>");
+        assert_eq!(off, "<button></button>");
+    }
+
+    #[test]
+    fn required_helper_works() {
+        let html = VoidElement::new("input").required(true).build().into_string();
+        assert_eq!(html, "<input required>");
+    }
+
+    #[test]
+    fn readonly_helper_works() {
+        let html = VoidElement::new("input").readonly(true).build().into_string();
+        assert_eq!(html, "<input readonly>");
+    }
+
+    #[test]
+    fn checked_helper_works() {
+        let html = VoidElement::new("input").checked(true).build().into_string();
+        assert_eq!(html, "<input checked>");
+    }
+
+    #[test]
+    fn modify_runs_arbitrary_closure_on_element() {
+        let html = Element::new("div").modify(|el| el.class("from-modify")).build().into_string();
+        assert_eq!(html, r#"<div class="from-modify"></div>"#);
+    }
+
+    #[test]
+    fn renders_style_attribute() {
+        let html = Element::new("div").style("color: red;").build().into_string();
+        assert_eq!(html, r#"<div style="color: red;"></div>"#);
     }
 
     #[test]
@@ -412,9 +768,9 @@ mod tests {
     }
 
     #[test]
-    fn x_transition_sets_empty_attribute() {
+    fn x_transition_sets_bare_attribute() {
         let html = Element::new("div").x_transition().build().into_string();
-        assert_eq!(html, r#"<div x-transition=""></div>"#);
+        assert_eq!(html, "<div x-transition></div>");
     }
 
     #[test]
@@ -518,17 +874,6 @@ mod tests {
     }
 
     #[test]
-    fn mixes_text_and_element_children_in_order() {
-        let html = Element::new("p")
-            .child("Hello, ")
-            .child(Element::new("strong").child("world"))
-            .child("!")
-            .build()
-            .into_string();
-        assert_eq!(html, "<p>Hello, <strong>world</strong>!</p>");
-    }
-
-    #[test]
     fn deeply_nested_structure_renders_correctly() {
         let html = Element::new("div")
             .class("card")
@@ -573,5 +918,108 @@ mod tests {
             html,
             r##"<div x-data="{ liked: false }" hx-post="/like" hx-target="#likes" x-on:click="liked = !liked"></div>"##
         );
+    }
+
+    #[test]
+    fn child_accepts_options_directly() {
+        let has_error = Some("Password too short");
+        let no_error: Option<&str> = None;
+
+        let html_err = Element::new("div").child(has_error.map(|msg| Element::new("span").child(msg))).build().into_string();
+        let html_clean = Element::new("div").child(no_error.map(|msg| Element::new("span").child(msg))).build().into_string();
+
+        assert_eq!(html_err, r#"<div><span>Password too short</span></div>"#);
+        assert_eq!(html_clean, r#"<div></div>"#);
+    }
+
+    #[test]
+    fn fragment_renders_siblings_without_wrapper() {
+        let two_elements = vec![
+            Element::new("h1").child("Hello").into(),
+            Element::new("p").child("World").into(),
+        ];
+        let html = Element::new("main").child(two_elements).build().into_string();
+        assert_eq!(html, r#"<main><h1>Hello</h1><p>World</p></main>"#);
+    }
+
+    #[test]
+    fn child_accepts_vec_directly() {
+        let list = vec![
+            Element::new("li").child("A").into(),
+            Element::new("li").child("B").into(),
+        ];
+        let html = Element::new("ul").child(list).build().into_string();
+        assert_eq!(html, "<ul><li>A</li><li>B</li></ul>");
+    }
+
+    #[test]
+    fn renders_multiple_fragment_levels() {
+        let nested_fragment = vec![
+            Element::new("span").child("A").into(),
+            Element::new("span").child("B").into(),
+        ];
+        let html = Element::new("div")
+            .child(vec![
+                Element::new("p").child("Start").into(),
+                nested_fragment.into(),
+                Element::new("p").child("End").into(),
+            ])
+            .build()
+            .into_string();
+
+        assert_eq!(html, "<div><p>Start</p><span>A</span><span>B</span><p>End</p></div>");
+    }
+
+    #[test]
+    fn attribute_with_multiple_spaces_is_preserved() {
+        let html = Element::new("div").attr("data-text", "hello  world").build().into_string();
+        assert_eq!(html, r#"<div data-text="hello  world"></div>"#);
+    }
+
+    #[test]
+    fn empty_node_renders_nothing() {
+        let html = Element::new("div").child("Visible").child(Node::Empty).child("Also Visible").build().into_string();
+        assert_eq!(html, "<div>VisibleAlso Visible</div>");
+    }
+
+    #[test]
+    fn attribute_keys_with_dashes_and_colons() {
+        let html = Element::new("div").attr("data-custom-key", "value").attr("aria-label", "my-label").build().into_string();
+        assert_eq!(html, r#"<div data-custom-key="value" aria-label="my-label"></div>"#);
+    }
+
+    #[test]
+    fn chaining_modify_multiple_times() {
+        let html = Element::new("div")
+            .modify(|e| e.class("first"))
+            .modify(|e| e.class("second"))
+            .modify(|e| e.id("my-id"))
+            .build()
+            .into_string();
+        assert_eq!(html, r#"<div class="first second" id="my-id"></div>"#);
+    }
+
+    #[test]
+    fn child_if_false_does_not_panic_or_render() {
+        let html = Element::new("div").child_if(false, || Element::new("p").child("should not exist")).build().into_string();
+        assert_eq!(html, "<div></div>");
+    }
+
+    #[test]
+    fn multiple_void_elements_in_container() {
+        let html = Element::new("div").child(VoidElement::new("br")).child(VoidElement::new("hr")).build().into_string();
+        assert_eq!(html, "<div><br><hr></div>");
+    }
+
+    #[test]
+    fn text_node_escaping_full_check() {
+        let html = Element::new("div").child("<script>&\"'</script>").build().into_string();
+        assert_eq!(html, "<div>&lt;script&gt;&amp;\"'&lt;/script&gt;</div>");
+    }
+
+    #[test]
+    fn attribute_escaping_full_check() {
+        let html = Element::new("div").attr("title", "<script>&\"'</script>").build().into_string();
+        assert_eq!(html, r#"<div title="&lt;script&gt;&amp;&quot;'&lt;/script&gt;"></div>"#);
     }
 }

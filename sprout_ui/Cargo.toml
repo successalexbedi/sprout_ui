@@ -8,3 +8,10 @@ maud = "0.26"
 sprout_ui_core = { path = "../sprout_ui_core" }
 sprout_ui_tags = { path = "../sprout_ui_tags" }
 sprout_ui_components = { path = "../sprout_ui_components" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ui_bench"
+harness = false
