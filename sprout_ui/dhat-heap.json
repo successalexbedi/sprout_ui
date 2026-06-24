@@ -1,0 +1,237 @@
+{
+"dhatFileVersion": 2,
+"mode": "rust-heap",
+"verb": "Allocated",
+"bklt": true,
+"bkacc": false,
+"tu": "µs",
+"Mtu": "s",
+"tuth": 10,
+"cmd": "/data/data/org.smartide.code/files/home/projects/project/sprout_ui/target/release/deps/memory_profile-d6433139cb7eb4e3 --bench",
+"pid": 20383,
+"tg": 407513222,
+"te": 407513225,
+"pps": [
+{
+"tb": 146400000,
+"tbk": 8600000,
+"tl": 2137261,
+"mb": 24,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2,
+3,
+4,
+5
+]
+},
+{
+"tb": 146400000,
+"tbk": 8600000,
+"tl": 2129370,
+"mb": 24,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2,
+3,
+6,
+5
+]
+},
+{
+"tb": 700000,
+"tbk": 100000,
+"tl": 44052,
+"mb": 7,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+7,
+8,
+5
+]
+},
+{
+"tb": 1682611180,
+"tbk": 500000,
+"tl": 39135436,
+"mb": 8688,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+9,
+8,
+5
+]
+},
+{
+"tb": 1698111180,
+"tbk": 500000,
+"tl": 36719226,
+"mb": 8768,
+"mbk": 1,
+"gb": 8768,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+9,
+4,
+5
+]
+},
+{
+"tb": 2240000,
+"tbk": 190000,
+"tl": 71586,
+"mb": 16,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2,
+10,
+5
+]
+},
+{
+"tb": 146400000,
+"tbk": 8600000,
+"tl": 2148497,
+"mb": 24,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2,
+3,
+8,
+5
+]
+},
+{
+"tb": 1200000,
+"tbk": 100000,
+"tl": 43018,
+"mb": 12,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+7,
+4,
+5
+]
+},
+{
+"tb": 4705555960,
+"tbk": 300000,
+"tl": 247341,
+"mb": 26912,
+"mbk": 1,
+"gb": 26912,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+11,
+5
+]
+},
+{
+"tb": 800000,
+"tbk": 100000,
+"tl": 44137,
+"mb": 8,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+7,
+6,
+5
+]
+},
+{
+"tb": 2800000,
+"tbk": 100000,
+"tl": 70000,
+"mb": 28,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2,
+12,
+5
+]
+},
+{
+"tb": 1685711180,
+"tbk": 500000,
+"tl": 40566256,
+"mb": 8704,
+"mbk": 1,
+"gb": 0,
+"gbk": 0,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+9,
+6,
+5
+]
+}
+],
+"ftbl": [
+"[root]",
+"0x7b350dc030: <dhat::Alloc as core::alloc::global::GlobalAlloc>::alloc (???:0:0)",
+"0x7b350b1a04: alloc::fmt::format::format_inner (???:0:0)",
+"0x7b350ad668: memory_profile::build_full_page::{{closure}} (???:0:0)",
+"0x7b350a7244: memory_profile::build_full_page (???:0:0)",
+"0x7b350b0410: memory_profile::main (???:0:0)",
+"0x7b350a60c4: memory_profile::build_full_page (???:0:0)",
+"0x7b350ad000: memory_profile::build_full_page::{{closure}} (???:0:0)",
+"0x7b350a6958: memory_profile::build_full_page (???:0:0)",
+"0x7b350ae704: memory_profile::build_full_page::{{closure}} (???:0:0)",
+"0x7b350a4908: memory_profile::build_full_page (???:0:0)",
+"0x7b350a6d38: memory_profile::build_full_page (???:0:0)",
+"0x7b350a1e0c: memory_profile::build_full_page (???:0:0)"
+]
+}

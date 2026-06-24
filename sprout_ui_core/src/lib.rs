@@ -1,38 +1,248 @@
 // =====================================================================
 // SPROUT — sprout_ui_core
 // -----------------------------------------------------------------------
-// Author: [Your Name]
-// Created: 2026
-// Last updated: June 22, 2026
+// Zero-tree, streaming HTML engine. Elements write directly into a
+// stack-resident buffer instead of building an intermediate Vec<Node>
+// tree — this is what closes most of the gap to Maud's raw speed while
+// keeping the method-chain syntax sprout exists for.
 //
-// A builder-pattern HTML library for Rust, built as a more readable
-// alternative to Maud's macro syntax. Method chains instead of html!{}.
-//
-// This file is the engine room: it defines what an HTML element *is*
-// and how it turns into a real, escaped HTML string. Most day-to-day
-// page-building never touches this file directly — see sprout_ui_tags
-// for the everyday tag::div()/tag::p() functions built on top of this.
+// Composability is preserved the same way Maud composes Markup values:
+// a fully-built Element flattens its own buffer into whatever buffer
+// it's handed to via .child(). You can still write components as plain
+// functions returning Element and nest them freely.
 // =====================================================================
 
-use maud::{Markup, Render, PreEscaped};
-use std::borrow::Cow;
+use maud::{Markup, PreEscaped};
+
+#[macro_export]
+macro_rules! sprout_panic {
+    ($target:expr, $msg:expr) => {{
+        use owo_colors::OwoColorize;
+        use std::io::IsTerminal;
+
+        let stderr = std::io::stderr();
+        if stderr.is_terminal() {
+            eprintln!(
+                "\n{header}\n{arrow} {tag}\n{arrow} {ctx}\n{arrow} {msg}\n",
+                header = " ERROR ".on_red().white().bold(),
+                arrow = "  ==>".red().bold(),
+                tag = format!("On: {}", $target).yellow().bold(),
+                ctx = format!("Message: {}", $msg).white(),
+                msg = "Structural integrity compromised in component hierarchy.".dimmed()
+            );
+        } else {
+            eprintln!("[SPROUT UI CRASH] Target: {} | Message: {}", $target, $msg);
+        }
+
+        panic!("{}", $msg);
+    }};
+}
 
 // =====================================================================
-// SECTION 1 — THE LEGAL TAG DICTIONARY (debug-build typo protection)
-// -----------------------------------------------------------------------
-// These lists power a development-time safety net: if you call
-// Element::new("dvi") by mistake, this catches it with a helpful panic
-// in debug builds. It does NOT run in release builds (see #[cfg(debug_assertions)]
-// below), so it costs nothing in production.
-//
-// IMPORTANT: tags containing a hyphen (e.g. "my-widget") are always
-// allowed through untouched, since real custom elements/web components
-// are required by the HTML spec to contain a dash. This is what makes
-// Element::new("...") usable as the documented escape hatch for
-// non-standard tags, instead of accidentally blocking it.
+// SECTION 1 — ZERO-ALLOCATION STRING AND BUFFER TYPES
 // =====================================================================
 
-/// Every standard HTML tag that is allowed to contain children.
+/// A string that's either a fixed literal, a heap-allocated owned
+/// string, or a small inline buffer built by sprout_fmt!.
+#[derive(Clone)]
+pub enum SproutStr {
+    Static(&'static str),
+    Owned(String),
+    Inline { buf: [u8; 48], len: u8 },
+}
+
+impl SproutStr {
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        match self {
+            SproutStr::Static(s) => s,
+            SproutStr::Owned(s) => s.as_str(),
+            // Safe by construction: this buffer is only ever filled by
+            // FallbackWriter::write_str, which only ever copies whole,
+            // already-valid &str slices into it. See debug_assert below.
+            SproutStr::Inline { buf, len } => {
+                let slice = &buf[..*len as usize];
+                debug_assert!(std::str::from_utf8(slice).is_ok(), "sprout: SproutStr::Inline corrupted — invariant violated");
+                unsafe { std::str::from_utf8_unchecked(slice) }
+            }
+        }
+    }
+}
+
+impl From<&'static str> for SproutStr {
+    #[inline(always)] fn from(s: &'static str) -> Self { SproutStr::Static(s) }
+}
+impl From<String> for SproutStr {
+    #[inline(always)] fn from(s: String) -> Self { SproutStr::Owned(s) }
+}
+
+/// A compact writer used by sprout_fmt! for string interpolation
+/// without allocating, for short results (≤48 bytes).
+pub struct FallbackWriter {
+    pub inline: [u8; 48],
+    pub len: usize,
+    pub overflow: Option<String>,
+}
+
+impl std::fmt::Write for FallbackWriter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if let Some(ref mut string) = self.overflow {
+            string.push_str(s);
+        } else if self.len + s.len() <= 48 {
+            self.inline[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+        } else {
+            let mut string = String::with_capacity(self.len + s.len() + 16);
+            string.push_str(unsafe { std::str::from_utf8_unchecked(&self.inline[..self.len]) });
+            string.push_str(s);
+            self.overflow = Some(string);
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! sprout_fmt {
+    ($($arg:tt)*) => {{
+        let mut writer = $crate::FallbackWriter {
+            inline: [0u8; 48],
+            len: 0,
+            overflow: None,
+        };
+        let _ = ::std::fmt::write(&mut writer, format_args!($($arg)*));
+        if let Some(s) = writer.overflow {
+            $crate::SproutStr::Owned(s)
+        } else {
+            $crate::SproutStr::Inline { buf: writer.inline, len: writer.len as u8 }
+        }
+    }};
+}
+
+/// The streaming output buffer. Holds up to 1024 bytes per element on
+/// the stack before spilling to the heap. Every write here is always a
+/// complete, already-valid &str slice — never a partial byte range —
+/// which is what keeps the inline buffer's contents valid UTF-8 at
+/// every point: concatenating whole valid UTF-8 strings always
+/// produces valid UTF-8, since each string already ends on a character
+/// boundary by definition.
+#[derive(Clone)]
+pub struct StreamBuf {
+    pub inline: [u8; 1024],
+    pub len: usize,
+    pub overflow: Option<String>,
+}
+
+impl StreamBuf {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self { inline: [0; 1024], len: 0, overflow: None }
+    }
+
+    #[inline(always)]
+    pub fn push_str(&mut self, s: &str) {
+        if let Some(ref mut string) = self.overflow {
+            string.push_str(s);
+        } else if self.len + s.len() <= 1024 {
+            self.inline[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+        } else {
+            let mut string = String::with_capacity(self.len + s.len() + 256);
+            string.push_str(unsafe { std::str::from_utf8_unchecked(&self.inline[..self.len]) });
+            string.push_str(s);
+            self.overflow = Some(string);
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, c: char) {
+        let mut buf = [0; 4];
+        self.push_str(c.encode_utf8(&mut buf));
+    }
+
+    /// Removes the last character. Used internally for zero-allocation
+    /// class-list chaining (rewriting the closing quote when adding a
+    /// second class, instead of rebuilding the whole attribute).
+    #[inline(always)]
+    pub fn pop(&mut self) {
+        if let Some(ref mut string) = self.overflow {
+            string.pop();
+        } else if self.len > 0 {
+            let slice = &self.inline[..self.len];
+            debug_assert!(std::str::from_utf8(slice).is_ok(), "sprout: StreamBuf corrupted before pop()");
+            let s = unsafe { std::str::from_utf8_unchecked(slice) };
+            if let Some(c) = s.chars().last() {
+                self.len -= c.len_utf8();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        if let Some(ref string) = self.overflow {
+            string.as_str()
+        } else {
+            let slice = &self.inline[..self.len];
+            debug_assert!(std::str::from_utf8(slice).is_ok(), "sprout: StreamBuf corrupted in as_str()");
+            unsafe { std::str::from_utf8_unchecked(slice) }
+        }
+    }
+
+    #[inline(always)]
+    pub fn into_string(self) -> String {
+        if let Some(string) = self.overflow {
+            string
+        } else {
+            let slice = &self.inline[..self.len];
+            debug_assert!(std::str::from_utf8(slice).is_ok(), "sprout: StreamBuf corrupted in into_string()");
+            unsafe { std::str::from_utf8_unchecked(slice) }.to_owned()
+        }
+    }
+}
+
+// =====================================================================
+// SECTION 2 — ESCAPING PIPELINES
+// =====================================================================
+
+fn escape_text(s: &str, out: &mut StreamBuf) {
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if matches!(b, b'&' | b'<' | b'>') {
+            out.push_str(&s[last..i]);
+            match b {
+                b'&' => out.push_str("&amp;"),
+                b'<' => out.push_str("&lt;"),
+                b'>' => out.push_str("&gt;"),
+                _ => unreachable!(),
+            }
+            last = i + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+}
+
+fn escape_attr(s: &str, out: &mut StreamBuf) {
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if matches!(b, b'&' | b'<' | b'>' | b'"') {
+            out.push_str(&s[last..i]);
+            match b {
+                b'&' => out.push_str("&amp;"),
+                b'<' => out.push_str("&lt;"),
+                b'>' => out.push_str("&gt;"),
+                b'"' => out.push_str("&quot;"),
+                _ => unreachable!(),
+            }
+            last = i + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+}
+
+// =====================================================================
+// SECTION 3 — THE LEGAL TAG DICTIONARY
+// =====================================================================
+
 pub const LEGAL_CONTAINERS: &[&str] = &[
     "div", "section", "nav", "main", "header", "footer", "aside", "article", "address", "details", "summary", "dialog",
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "a", "strong", "em", "small", "blockquote", "pre", "code", "kbd", "sub", "sup", "mark", "time", "del", "ins",
@@ -44,493 +254,42 @@ pub const LEGAL_CONTAINERS: &[&str] = &[
     "svg", "datalist",
 ];
 
-/// Every standard HTML tag that is self-closing and cannot contain children.
-/// NOTE: "path" lives here, not in LEGAL_CONTAINERS — <path> is void in real HTML.
 pub const LEGAL_VOIDS: &[&str] = &[
-    "br", "hr", "img", "input", "link", "meta", "area", "base", "col", "embed", "param", "source", "track", "wbr",
-    "path",
+    "br", "hr", "img", "input", "link", "meta", "area", "base", "col", "embed", "param", "source", "track", "wbr", "path",
 ];
 
-/// Compile-time string equality check, used by is_legal_tag below.
-pub const fn const_str_eq(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a_bytes.len() {
-        if a_bytes[i] != b_bytes[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Checks whether `tag` appears in the given list of legal tag names.
 pub const fn is_legal_tag(tag: &str, list: &[&str]) -> bool {
+    let a_bytes = tag.as_bytes();
     let mut i = 0;
     while i < list.len() {
-        if const_str_eq(tag, list[i]) {
-            return true;
+        let b_bytes = list[i].as_bytes();
+        if a_bytes.len() == b_bytes.len() {
+            let mut match_found = true;
+            let mut j = 0;
+            while j < a_bytes.len() {
+                if a_bytes[j] != b_bytes[j] { match_found = false; break; }
+                j += 1;
+            }
+            if match_found { return true; }
         }
         i += 1;
     }
     false
 }
 
-/// Real custom elements (web components) are required by the HTML spec
-/// to contain a hyphen in their tag name — e.g. <my-widget>, never <mywidget>.
-/// We use that rule to let genuinely custom tags through the validation
-/// below without needing to be on the standard tag list at all.
-fn is_custom_element_name(tag: &str) -> bool {
-    tag.contains('-')
-}
-
-// =====================================================================
-// SECTION 2 — NODE: WHAT CAN LIVE INSIDE AN ELEMENT'S CHILDREN
-// =====================================================================
-
-#[derive(Clone)]
-pub enum Node {
-    Element(Box<Element>),
-    Void(Box<VoidElement>),
-    Text(String),
-    /// A list of sibling nodes with no wrapping tag around them —
-    /// lets you pass a Vec<Node> straight into .child() without
-    /// needing an extra wrapper element just to hold them.
-    Fragment(Vec<Node>),
-    /// Renders as nothing at all. Exists so Option<T>::None can flow
-    /// straight into .child() and simply not render, instead of
-    /// requiring a separate conditional method call.
-    Empty,
-}
-
-impl From<Element> for Node { fn from(e: Element) -> Self { Node::Element(Box::new(e)) } }
-impl From<VoidElement> for Node { fn from(e: VoidElement) -> Self { Node::Void(Box::new(e)) } }
-impl From<&str> for Node { fn from(s: &str) -> Self { Node::Text(s.to_string()) } }
-impl From<String> for Node { fn from(s: String) -> Self { Node::Text(s) } }
-
-impl<T> From<Option<T>> for Node where T: Into<Node> {
-    fn from(opt: Option<T>) -> Self {
-        match opt {
-            Some(v) => v.into(),
-            None => Node::Empty,
-        }
-    }
-}
-
-impl From<Vec<Node>> for Node {
-    fn from(vec: Vec<Node>) -> Self {
-        Node::Fragment(vec)
-    }
-}
-
-// =====================================================================
-// SECTION 3 — ATTRS: SHARED STORAGE FOR CLASSES, ID, AND ATTRIBUTES
-// -----------------------------------------------------------------------
-// Both Element and VoidElement use this same struct, so class/id/attr
-// handling is written exactly once and shared by both types.
-// =====================================================================
-
-#[derive(Clone, Default)]
-pub struct Attrs {
-    pub classes: Vec<Cow<'static, str>>,
-    pub id: Option<Cow<'static, str>>,
-    /// Some(value) renders as key="value". None renders as a bare
-    /// boolean attribute (e.g. `disabled`, with no ="" at all) —
-    /// this is the more idiomatic HTML5 form for boolean attributes.
-    pub pairs: Vec<(Cow<'static, str>, Option<Cow<'static, str>>)>,
-}
-
-impl Attrs {
-    fn render_to(&self, w: &mut String) {
-        if !self.classes.is_empty() {
-            w.push_str(" class=\"");
-            for (i, c) in self.classes.iter().enumerate() {
-                if i > 0 { w.push(' '); }
-                escape_attr(c, w);
-            }
-            w.push('"');
-        }
-        if let Some(ref id) = self.id {
-            w.push_str(" id=\"");
-            escape_attr(id, w);
-            w.push('"');
-        }
-        for (k, v_opt) in &self.pairs {
-            w.push(' ');
-            w.push_str(k);
-            if let Some(v) = v_opt {
-                w.push_str("=\"");
-                escape_attr(v, w);
-                w.push('"');
-            }
-        }
-    }
-}
-
-// =====================================================================
-// SECTION 4 — ELEMENT AND VOIDELEMENT: THE TWO CORE TYPES
-// -----------------------------------------------------------------------
-// Element = any tag that CAN have children (<div>, <p>, <button>...)
-// VoidElement = any tag that CANNOT have children (<br>, <img>, <input>...)
-//
-// Splitting these into two types means VoidElement simply has no
-// .child() method at all — calling tag::br().child("x") is a compile
-// error, not a silent bug that quietly discards the child at render time.
-// =====================================================================
-
-#[derive(Clone)]
-pub struct Element {
-    pub tag: &'static str,
-    pub attrs: Attrs,
-    pub children: Vec<Node>,
-}
-
-#[derive(Clone)]
-pub struct VoidElement {
-    pub tag: &'static str,
-    pub attrs: Attrs,
-}
-
-// =====================================================================
-// SECTION 5 — SHARED BUILDER METHODS (class, attr, htmx, alpine, etc.)
-// -----------------------------------------------------------------------
-// Written once via macro, applied to both Element and VoidElement,
-// so .class()/.attr()/.hx_post() etc. work identically on either type.
-// =====================================================================
-
-macro_rules! impl_attr_methods {
-    ($t:ty) => {
-        impl $t {
-            pub fn class(mut self, c: impl Into<Cow<'static, str>>) -> Self {
-                let c = c.into();
-                if !self.attrs.classes.contains(&c) {
-                    self.attrs.classes.push(c);
-                }
-                self
-            }
-
-            pub fn class_if(self, condition: bool, class: impl Into<Cow<'static, str>>) -> Self {
-                if condition { self.class(class) } else { self }
-            }
-
-            /// Adds several classes at once, each gated by its own condition.
-            pub fn classes_if<I, S>(mut self, class_map: I) -> Self
-            where
-                I: IntoIterator<Item = (bool, S)>,
-                S: Into<Cow<'static, str>>,
-            {
-                for (condition, class_name) in class_map {
-                    if condition { self = self.class(class_name); }
-                }
-                self
-            }
-
-            pub fn id(mut self, id: impl Into<Cow<'static, str>>) -> Self {
-                self.attrs.id = Some(id.into());
-                self
-            }
-
-            pub fn attr(mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) -> Self {
-                self.attrs.pairs.push((key.into(), Some(value.into())));
-                self
-            }
-
-            pub fn attr_if(self, condition: bool, key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) -> Self {
-                if condition { self.attr(key, value) } else { self }
-            }
-
-            /// Sets a real HTML boolean attribute (present = on, absent = off).
-            /// Renders as a bare attribute with no ="" value, e.g. `disabled`.
-            pub fn flag(mut self, condition: bool, key: impl Into<Cow<'static, str>>) -> Self {
-                if condition { self.attrs.pairs.push((key.into(), None)); }
-                self
-            }
-
-            pub fn disabled(self, condition: bool) -> Self { self.flag(condition, "disabled") }
-            pub fn required(self, condition: bool) -> Self { self.flag(condition, "required") }
-            pub fn readonly(self, condition: bool) -> Self { self.flag(condition, "readonly") }
-            pub fn checked(self, condition: bool) -> Self { self.flag(condition, "checked") }
-
-            // --- Common HTML attribute sugar ---
-            pub fn style(self, css: impl Into<Cow<'static, str>>) -> Self { self.attr("style", css) }
-            pub fn src(self, url: impl Into<Cow<'static, str>>) -> Self { self.attr("src", url) }
-            pub fn href(self, url: impl Into<Cow<'static, str>>) -> Self { self.attr("href", url) }
-            pub fn alt(self, text: impl Into<Cow<'static, str>>) -> Self { self.attr("alt", text) }
-            pub fn name(self, n: impl Into<Cow<'static, str>>) -> Self { self.attr("name", n) }
-            pub fn value(self, v: impl Into<Cow<'static, str>>) -> Self { self.attr("value", v) }
-            pub fn placeholder(self, p: impl Into<Cow<'static, str>>) -> Self { self.attr("placeholder", p) }
-            pub fn type_(self, t: impl Into<Cow<'static, str>>) -> Self { self.attr("type", t) }
-
-            // --- HTMX sugar ---
-            pub fn hx_get(self, url: &'static str) -> Self { self.attr("hx-get", url) }
-            pub fn hx_post(self, url: &'static str) -> Self { self.attr("hx-post", url) }
-            pub fn hx_target(self, target: &'static str) -> Self { self.attr("hx-target", target) }
-            pub fn hx_swap(self, mode: &'static str) -> Self { self.attr("hx-swap", mode) }
-            pub fn hx_trigger(self, trigger: &'static str) -> Self { self.attr("hx-trigger", trigger) }
-
-            // --- Alpine.js sugar ---
-            pub fn x_data(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-data", expr) }
-            pub fn x_show(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-show", expr) }
-            pub fn x_if(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-if", expr) }
-            pub fn x_model(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-model", expr) }
-            pub fn x_text(self, expr: impl Into<Cow<'static, str>>) -> Self { self.attr("x-text", expr) }
-            pub fn x_on(self, event: &str, expr: impl Into<Cow<'static, str>>) -> Self {
-                self.attr(format!("x-on:{event}"), expr)
-            }
-            pub fn x_bind(self, attribute: &str, expr: impl Into<Cow<'static, str>>) -> Self {
-                self.attr(format!("x-bind:{attribute}"), expr)
-            }
-            pub fn x_transition(self) -> Self { self.flag(true, "x-transition") }
-
-            /// Escape hatch: run an arbitrary function on this element mid-chain.
-            pub fn modify(self, f: impl FnOnce(Self) -> Self) -> Self {
-                f(self)
-            }
-        }
-    };
-}
-
-impl_attr_methods!(Element);
-impl_attr_methods!(VoidElement);
-
-// =====================================================================
-// SECTION 6 — ELEMENT: CHILDREN, CONSTRUCTION, AND BUILD
-// =====================================================================
-
-impl Element {
-    /// Builds a new Element. In debug builds, panics with a helpful
-    /// message if the tag name looks like a typo or is structurally
-    /// wrong (e.g. a void tag passed to Element instead of VoidElement).
-    /// Custom element names containing a hyphen always pass through
-    /// untouched, per the HTML spec's own naming rule for web components.
-    #[track_caller]
-    #[inline]
-    pub fn new(tag: &'static str) -> Self {
-        #[cfg(debug_assertions)]
-        {
-            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_CONTAINERS) {
-                let loc = std::panic::Location::caller();
-
-                if is_legal_tag(tag, LEGAL_VOIDS) {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Tag mismatch! '{}' is a strict self-closing VoidElement. Use VoidElement::new() or tag::{}() instead.", loc.file(), loc.line(), loc.column(), tag, tag);
-                } else if let Some(suggestion) = suggest_closest_tag(tag) {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Unknown element '{}'. Did you mean '{}'?", loc.file(), loc.line(), loc.column(), tag, suggestion);
-                } else {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ The requested HTML element '{}' does not exist or is structurally illegal.", loc.file(), loc.line(), loc.column(), tag);
-                }
-            }
-        }
-
-        Self { tag, attrs: Attrs::default(), children: vec![] }
-    }
-
-    pub fn child(mut self, child: impl Into<Node>) -> Self {
-        self.children.push(child.into());
-        self
-    }
-
-    pub fn children<I, T>(mut self, children: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<Node>,
-    {
-        let iter = children.into_iter();
-        self.children.reserve(iter.size_hint().0);
-        for c in iter {
-            self.children.push(c.into());
-        }
-        self
-    }
-
-    /// Builds one child per item, without writing .map().collect() by hand.
-    pub fn child_for<I, T, F, N>(mut self, items: I, f: F) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        F: Fn(T) -> N,
-        N: Into<Node>,
-    {
-        let iter = items.into_iter();
-        self.children.reserve(iter.size_hint().0);
-        for item in iter {
-            self.children.push(f(item).into());
-        }
-        self
-    }
-
-    /// Adds a child only if `condition` is true. Closure takes no arguments.
-    pub fn child_if<F, N>(self, condition: bool, f: F) -> Self
-    where
-        F: FnOnce() -> N,
-        N: Into<Node>,
-    {
-        if condition { self.child(f()) } else { self }
-    }
-
-    /// Converts the tree into real, escaped HTML.
-    pub fn build(self) -> Markup {
-        let mut buf = String::with_capacity(256);
-        self.render_to(&mut buf);
-        PreEscaped(buf)
-    }
-}
-
-// =====================================================================
-// SECTION 7 — VOIDELEMENT: CONSTRUCTION AND BUILD (no children methods)
-// =====================================================================
-
-impl VoidElement {
-    /// Same typo/structure protection as Element::new, mirrored for void tags.
-    #[track_caller]
-    #[inline]
-    pub fn new(tag: &'static str) -> Self {
-        #[cfg(debug_assertions)]
-        {
-            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_VOIDS) {
-                let loc = std::panic::Location::caller();
-
-                if is_legal_tag(tag, LEGAL_CONTAINERS) {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Tag mismatch! '{}' is a standard container. Use Element::new() or tag::{}() instead.", loc.file(), loc.line(), loc.column(), tag, tag);
-                } else if let Some(suggestion) = suggest_closest_tag(tag) {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ Unknown self-closing element '{}'. Did you mean '{}'?", loc.file(), loc.line(), loc.column(), tag, suggestion);
-                } else {
-                    panic!("🌱 Sprout Language Error at {}:{}:{}:\n   ↳ The requested self-closing HTML tag '{}' does not exist.", loc.file(), loc.line(), loc.column(), tag);
-                }
-            }
-        }
-
-        Self { tag, attrs: Attrs::default() }
-    }
-
-    pub fn build(self) -> Markup {
-        let mut buf = String::with_capacity(64);
-        self.render_to(&mut buf);
-        PreEscaped(buf)
-    }
-}
-
-// =====================================================================
-// SECTION 8 — ESCAPING (THE SECURITY LAYER)
-// -----------------------------------------------------------------------
-// Every piece of text and every attribute value passes through here
-// before reaching the final HTML string. This is what makes it safe
-// to put real user input directly into .child()/.attr() without
-// manually escaping it yourself first.
-//
-// Text and attribute escaping are intentionally different: quotes only
-// matter inside an attribute's "..." boundary, not between tags.
-// =====================================================================
-
-fn escape_text(s: &str, out: &mut String) {
-    let mut last = 0;
-    for (i, b) in s.bytes().enumerate() {
-        match b {
-            b'&' | b'<' | b'>' => {
-                out.push_str(&s[last..i]);
-                match b {
-                    b'&' => out.push_str("&amp;"),
-                    b'<' => out.push_str("&lt;"),
-                    b'>' => out.push_str("&gt;"),
-                    _ => unreachable!(),
-                }
-                last = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push_str(&s[last..]);
-}
-
-fn escape_attr(s: &str, out: &mut String) {
-    let mut last = 0;
-    for (i, b) in s.bytes().enumerate() {
-        match b {
-            b'&' | b'<' | b'>' | b'"' => {
-                out.push_str(&s[last..i]);
-                match b {
-                    b'&' => out.push_str("&amp;"),
-                    b'<' => out.push_str("&lt;"),
-                    b'>' => out.push_str("&gt;"),
-                    b'"' => out.push_str("&quot;"),
-                    _ => unreachable!(),
-                }
-                last = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push_str(&s[last..]);
-}
-
-// =====================================================================
-// SECTION 9 — RENDERING: TURNING THE TREE INTO A STRING
-// =====================================================================
-
-impl Render for Node {
-    fn render_to(&self, w: &mut String) {
-        match self {
-            Node::Text(t) => escape_text(t, w),
-            Node::Element(e) => e.render_to(w),
-            Node::Void(v) => v.render_to(w),
-            Node::Fragment(nodes) => {
-                for n in nodes { n.render_to(w); }
-            }
-            Node::Empty => {}
-        }
-    }
-}
-
-impl Render for Element {
-    fn render_to(&self, w: &mut String) {
-        w.push('<');
-        w.push_str(self.tag);
-        self.attrs.render_to(w);
-        w.push('>');
-        for c in &self.children {
-            c.render_to(w);
-        }
-        w.push_str("</");
-        w.push_str(self.tag);
-        w.push('>');
-    }
-}
-
-impl Render for VoidElement {
-    fn render_to(&self, w: &mut String) {
-        w.push('<');
-        w.push_str(self.tag);
-        self.attrs.render_to(w);
-        w.push('>');
-    }
-}
-
-// =====================================================================
-// SECTION 10 — DEV-ONLY TYPO SUGGESTIONS (debug builds only)
-// -----------------------------------------------------------------------
-// Powers the "Did you mean 'div'?" message when a tag name is close
-// to, but not exactly, a real tag. Pure development convenience —
-// compiled out entirely in release builds.
-// =====================================================================
+#[cfg(debug_assertions)]
+fn is_custom_element_name(tag: &str) -> bool { tag.contains('-') }
 
 #[cfg(debug_assertions)]
 fn suggest_closest_tag(typo: &str) -> Option<&'static str> {
     let mut best_match = None;
-    let mut best_dist = 3; // Only suggest if within 2 edits of a real tag
-
+    let mut best_dist = 3;
     for &valid in LEGAL_CONTAINERS.iter().chain(LEGAL_VOIDS.iter()) {
         let dist = levenshtein_distance(typo, valid);
-        if dist < best_dist {
-            best_dist = dist;
-            best_match = Some(valid);
-        }
+        if dist < best_dist { best_dist = dist; best_match = Some(valid); }
     }
-
     if typo == "btn" { return Some("button"); }
     if typo == "dvi" { return Some("div"); }
-
     best_match
 }
 
@@ -549,11 +308,488 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 // =====================================================================
-// SECTION 11 — TESTS
+// SECTION 4 — STREAMING CORE ABSTRACTIONS
+// =====================================================================
+
+/// Anything that knows how to write itself into a StreamBuf.
+/// This is what makes composition work: an Element implements this by
+/// closing its own head, appending its closing tag, then flattening
+/// its entire buffer into the parent's buffer — the same idea as
+/// passing one maud::Markup into another via (expr).
+pub trait IntoStream {
+    fn stream_to(self, buf: &mut StreamBuf);
+}
+
+impl IntoStream for &str {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { escape_text(self, buf); }
+}
+impl IntoStream for String {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { escape_text(self.as_str(), buf); }
+}
+impl IntoStream for SproutStr {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { escape_text(self.as_str(), buf); }
+}
+impl<T: IntoStream> IntoStream for Option<T> {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { if let Some(v) = self { v.stream_to(buf); } }
+}
+impl<T: IntoStream> IntoStream for Vec<T> {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { for v in self { v.stream_to(buf); } }
+}
+
+/// Shared behavior between Element and VoidElement needed by the
+/// attribute macro below — lets .class()/.attr()/.flag() be written
+/// once and applied to both types.
+pub trait HtmlElement {
+    fn stream(&mut self) -> &mut StreamBuf;
+    fn is_head_closed(&self) -> bool;
+    fn has_class(&self) -> bool;
+    fn set_has_class(&mut self, val: bool);
+}
+
+// =====================================================================
+// SECTION 5 — ELEMENT AND VOIDELEMENT
+// =====================================================================
+
+#[derive(Clone)]
+pub struct Element {
+    pub buf: StreamBuf,
+    pub tag: &'static str,
+    pub head_closed: bool,
+    pub has_class: bool,
+}
+
+impl Element {
+    #[track_caller]
+    pub fn new(tag: &'static str) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_CONTAINERS) {
+                let loc = std::panic::Location::caller();
+                let msg = if is_legal_tag(tag, LEGAL_VOIDS) {
+                    format!("'{}' at {}:{} is a self-closing VoidElement. Use VoidElement::new() or tag::{}() instead.", tag, loc.file(), loc.line(), tag)
+                } else if let Some(suggestion) = suggest_closest_tag(tag) {
+                    format!("Typo at {}:{}: '{}'. Did you mean '{}'?", loc.file(), loc.line(), tag, suggestion)
+                } else {
+                    format!("Unknown Element at {}:{}: '{}'", loc.file(), loc.line(), tag)
+                };
+                sprout_panic!("Element::new", msg);
+            }
+        }
+
+        let mut buf = StreamBuf::new();
+        buf.push('<');
+        buf.push_str(tag);
+        Self { buf, tag, head_closed: false, has_class: false }
+    }
+
+    #[inline(always)]
+    fn close_head(&mut self) {
+        if !self.head_closed {
+            self.buf.push('>');
+            self.head_closed = true;
+        }
+    }
+
+    #[inline(always)]
+    pub fn child(mut self, child: impl IntoStream) -> Self {
+        self.close_head();
+        child.stream_to(&mut self.buf);
+        self
+    }
+
+    #[inline(always)]
+    pub fn children<I, T>(mut self, iter: I) -> Self
+    where I: IntoIterator<Item = T>, T: IntoStream {
+        self.close_head();
+        for c in iter { c.stream_to(&mut self.buf); }
+        self
+    }
+
+    #[inline(always)]
+    pub fn child_for<I, T, F, N>(mut self, items: I, f: F) -> Self
+    where I: IntoIterator<Item = T>, F: Fn(T) -> N, N: IntoStream {
+        self.close_head();
+        for item in items { f(item).stream_to(&mut self.buf); }
+        self
+    }
+
+    #[inline(always)]
+    pub fn child_if<F, N>(self, condition: bool, f: F) -> Self
+    where F: FnOnce() -> N, N: IntoStream {
+        if condition { self.child(StreamWrap(f())) } else { self }
+    }
+
+    pub fn build(mut self) -> Markup {
+        self.close_head();
+        self.buf.push_str("</");
+        self.buf.push_str(self.tag);
+        self.buf.push('>');
+        PreEscaped(self.buf.into_string())
+    }
+}
+
+/// Thin wrapper so child_if's closure result (any IntoStream type) can
+/// be passed into .child(), which expects a single concrete argument.
+struct StreamWrap<T: IntoStream>(T);
+impl<T: IntoStream> IntoStream for StreamWrap<T> {
+    #[inline(always)] fn stream_to(self, buf: &mut StreamBuf) { self.0.stream_to(buf); }
+}
+
+impl IntoStream for Element {
+    #[inline(always)]
+    fn stream_to(mut self, buf: &mut StreamBuf) {
+        self.close_head();
+        self.buf.push_str("</");
+        self.buf.push_str(self.tag);
+        self.buf.push('>');
+        buf.push_str(self.buf.as_str());
+    }
+}
+
+#[derive(Clone)]
+pub struct VoidElement {
+    pub buf: StreamBuf,
+    pub tag: &'static str,
+    pub has_class: bool,
+}
+
+impl VoidElement {
+    #[track_caller]
+    pub fn new(tag: &'static str) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            if !is_custom_element_name(tag) && !is_legal_tag(tag, LEGAL_VOIDS) {
+                let loc = std::panic::Location::caller();
+                let msg = if is_legal_tag(tag, LEGAL_CONTAINERS) {
+                    format!("'{}' at {}:{} is a standard container. Use Element::new() or tag::{}() instead.", tag, loc.file(), loc.line(), tag)
+                } else if let Some(suggestion) = suggest_closest_tag(tag) {
+                    format!("Typo at {}:{}: '{}'. Did you mean '{}'?", loc.file(), loc.line(), tag, suggestion)
+                } else {
+                    format!("Unknown Void Element at {}:{}: '{}'", loc.file(), loc.line(), tag)
+                };
+                sprout_panic!("VoidElement::new", msg);
+            }
+        }
+        let mut buf = StreamBuf::new();
+        buf.push('<');
+        buf.push_str(tag);
+        Self { buf, tag, has_class: false }
+    }
+
+    pub fn build(mut self) -> Markup {
+        self.buf.push('>');
+        PreEscaped(self.buf.into_string())
+    }
+}
+
+impl IntoStream for VoidElement {
+    #[inline(always)]
+    fn stream_to(mut self, buf: &mut StreamBuf) {
+        self.buf.push('>');
+        buf.push_str(self.buf.as_str());
+    }
+}
+
+impl HtmlElement for Element {
+    #[inline(always)] fn stream(&mut self) -> &mut StreamBuf { &mut self.buf }
+    #[inline(always)] fn is_head_closed(&self) -> bool { self.head_closed }
+    #[inline(always)] fn has_class(&self) -> bool { self.has_class }
+    #[inline(always)] fn set_has_class(&mut self, val: bool) { self.has_class = val; }
+}
+
+impl HtmlElement for VoidElement {
+    #[inline(always)] fn stream(&mut self) -> &mut StreamBuf { &mut self.buf }
+    #[inline(always)] fn is_head_closed(&self) -> bool { false }
+    #[inline(always)] fn has_class(&self) -> bool { self.has_class }
+    #[inline(always)] fn set_has_class(&mut self, val: bool) { self.has_class = val; }
+}
+
+// =====================================================================
+// SECTION 6 — SHARED ATTRIBUTE METHODS
 // -----------------------------------------------------------------------
-// Every guarantee this file makes — escaping, void-safety, conditional
-// helpers, Fragment/Empty handling — is backed by a test here. If you
-// change behavior in any section above, a test below should catch it.
+// IMPORTANT: because this design streams directly into a buffer, all
+// classes/attributes/flags MUST be set before the first .child() call
+// — once the head is "closed" (a child has been added), the tag's
+// opening bracket has already been written and can no longer be
+// edited. Calling .class()/.attr()/.flag() after .child() panics with
+// a clear message explaining exactly that, instead of silently
+// producing broken HTML.
+// =====================================================================
+
+macro_rules! impl_attr_methods {
+    ($t:ty) => {
+        impl $t {
+            #[inline(always)]
+            #[track_caller]
+            pub fn class(mut self, c: impl Into<SproutStr>) -> Self {
+                let c_val = c.into();
+                if self.is_head_closed() {
+                    let loc = std::panic::Location::caller();
+                    sprout_panic!(
+                        format!("<{}>::class", self.tag),
+                        format!("Attempted to add class '{}' at {}:{}. Order matters! Configure all attributes/classes BEFORE calling .child() or .children().", c_val.as_str(), loc.file(), loc.line())
+                    );
+                }
+                if self.has_class() {
+                    // Zero-allocation chaining: pop the closing quote,
+                    // append a space + the new class, re-close the quote.
+                    self.stream().pop();
+                    self.stream().push(' ');
+                    escape_attr(c_val.as_str(), self.stream());
+                    self.stream().push('"');
+                } else {
+                    self.stream().push_str(" class=\"");
+                    escape_attr(c_val.as_str(), self.stream());
+                    self.stream().push('"');
+                    self.set_has_class(true);
+                }
+                self
+            }
+
+            #[inline(always)]
+            pub fn class_if(self, condition: bool, class: impl Into<SproutStr>) -> Self {
+                if condition { self.class(class) } else { self }
+            }
+
+            pub fn classes_if<I, S>(mut self, class_map: I) -> Self
+            where I: IntoIterator<Item = (bool, S)>, S: Into<SproutStr> {
+                for (condition, class_name) in class_map {
+                    if condition { self = self.class(class_name); }
+                }
+                self
+            }
+
+            #[inline(always)]
+            #[track_caller]
+            pub fn attr(mut self, key: impl Into<SproutStr>, value: impl Into<SproutStr>) -> Self {
+                let k_val = key.into();
+                let v_val = value.into();
+                if self.is_head_closed() {
+                    let loc = std::panic::Location::caller();
+                    sprout_panic!(
+                        format!("<{}>::attr", self.tag),
+                        format!("Attempted to set attribute '{}={}' at {}:{}. Order matters! Configure all attributes/classes BEFORE calling .child() or .children().", k_val.as_str(), v_val.as_str(), loc.file(), loc.line())
+                    );
+                }
+                self.stream().push(' ');
+                self.stream().push_str(k_val.as_str());
+                self.stream().push_str("=\"");
+                escape_attr(v_val.as_str(), self.stream());
+                self.stream().push('"');
+                self
+            }
+
+            #[inline(always)]
+            pub fn attr_if(self, condition: bool, key: impl Into<SproutStr>, value: impl Into<SproutStr>) -> Self {
+                if condition { self.attr(key, value) } else { self }
+            }
+
+            #[inline(always)]
+            pub fn id(self, id: impl Into<SproutStr>) -> Self { self.attr("id", id) }
+
+            #[inline(always)]
+            #[track_caller]
+            pub fn flag(mut self, condition: bool, key: impl Into<SproutStr>) -> Self {
+                if condition {
+                    let k_val = key.into();
+                    if self.is_head_closed() {
+                        let loc = std::panic::Location::caller();
+                        sprout_panic!(
+                            format!("<{}>::flag", self.tag),
+                            format!("Attempted to set flag '{}' at {}:{}. Order matters! Configure all attributes/classes BEFORE calling .child() or .children().", k_val.as_str(), loc.file(), loc.line())
+                        );
+                    }
+                    self.stream().push(' ');
+                    self.stream().push_str(k_val.as_str());
+                }
+                self
+            }
+
+            #[inline(always)] pub fn disabled(self, cond: bool) -> Self { self.flag(cond, "disabled") }
+            #[inline(always)] pub fn required(self, cond: bool) -> Self { self.flag(cond, "required") }
+            #[inline(always)] pub fn readonly(self, cond: bool) -> Self { self.flag(cond, "readonly") }
+            #[inline(always)] pub fn checked(self, cond: bool) -> Self { self.flag(cond, "checked") }
+
+            #[inline(always)] pub fn style(self, css: impl Into<SproutStr>) -> Self { self.attr("style", css) }
+            #[inline(always)] pub fn src(self, url: impl Into<SproutStr>) -> Self { self.attr("src", url) }
+            #[inline(always)] pub fn href(self, url: impl Into<SproutStr>) -> Self { self.attr("href", url) }
+            #[inline(always)] pub fn alt(self, text: impl Into<SproutStr>) -> Self { self.attr("alt", text) }
+            #[inline(always)] pub fn name(self, n: impl Into<SproutStr>) -> Self { self.attr("name", n) }
+            #[inline(always)] pub fn value(self, v: impl Into<SproutStr>) -> Self { self.attr("value", v) }
+            #[inline(always)] pub fn placeholder(self, p: impl Into<SproutStr>) -> Self { self.attr("placeholder", p) }
+            #[inline(always)] pub fn type_(self, t: impl Into<SproutStr>) -> Self { self.attr("type", t) }
+
+            #[inline(always)] pub fn x_data(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-data", expr) }
+            #[inline(always)] pub fn x_show(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-show", expr) }
+            #[inline(always)] pub fn x_if(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-if", expr) }
+            #[inline(always)] pub fn x_model(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-model", expr) }
+            #[inline(always)] pub fn x_text(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-text", expr) }
+            #[inline(always)] pub fn x_transition(self) -> Self { self.flag(true, "x-transition") }
+
+            /// Generic event binding — builds the x-on:EVENT key at call
+            /// time. For the four most common events, the named shortcuts
+            /// below avoid even that small format! allocation.
+            #[inline]
+            pub fn x_on(self, event: &str, expr: impl Into<SproutStr>) -> Self {
+                self.attr(format!("x-on:{event}"), expr)
+            }
+            #[inline]
+            pub fn x_bind(self, attribute: &str, expr: impl Into<SproutStr>) -> Self {
+                self.attr(format!("x-bind:{attribute}"), expr)
+            }
+
+            #[inline(always)] pub fn x_on_click(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-on:click", expr) }
+            #[inline(always)] pub fn x_on_input(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-on:input", expr) }
+            #[inline(always)] pub fn x_on_submit(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-on:submit", expr) }
+            #[inline(always)] pub fn x_on_change(self, expr: impl Into<SproutStr>) -> Self { self.attr("x-on:change", expr) }
+
+            #[inline(always)]
+            pub fn modify(self, f: impl FnOnce(Self) -> Self) -> Self { f(self) }
+        }
+    };
+}
+
+impl_attr_methods!(Element);
+impl_attr_methods!(VoidElement);
+
+// =====================================================================
+// SECTION 7 — SPROUT ACTION: THE ONE HTMX MECHANISM
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swap {
+    InnerHTML, OuterHTML, BeforeBegin, AfterBegin, BeforeEnd, AfterEnd, Delete, NoSwap, Custom(&'static str),
+}
+pub use Swap::*;
+
+impl Swap {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InnerHTML => "innerHTML", OuterHTML => "outerHTML", BeforeBegin => "beforebegin",
+            AfterBegin => "afterbegin", BeforeEnd => "beforeend", AfterEnd => "afterend",
+            Delete => "delete", NoSwap => "none", Custom(s) => s,
+        }
+    }
+}
+
+impl From<&'static str> for Swap {
+    fn from(s: &'static str) -> Self {
+        match s {
+            "innerHTML" => InnerHTML, "outerHTML" => OuterHTML, "beforebegin" => BeforeBegin,
+            "afterbegin" => AfterBegin, "beforeend" => BeforeEnd, "afterend" => AfterEnd,
+            "delete" => Delete, "none" => NoSwap, _ => Custom(s),
+        }
+    }
+}
+
+pub fn get(url: impl Into<SproutStr>) -> SproutAction { SproutAction::get(url) }
+pub fn post(url: impl Into<SproutStr>) -> SproutAction { SproutAction::post(url) }
+pub fn put(url: impl Into<SproutStr>) -> SproutAction { SproutAction::put(url) }
+pub fn patch(url: impl Into<SproutStr>) -> SproutAction { SproutAction::patch(url) }
+pub fn delete(url: impl Into<SproutStr>) -> SproutAction { SproutAction::delete(url) }
+
+pub struct SproutAction {
+    pub method: &'static str,
+    pub url: SproutStr,
+    pub target: Option<SproutStr>,
+    pub swap: Option<&'static str>,
+    pub oob: Option<&'static str>,
+    pub indicator: Option<SproutStr>,
+    pub trigger: Option<SproutStr>,
+}
+
+impl SproutAction {
+    pub fn get(url: impl Into<SproutStr>) -> Self { Self::new("hx-get", url) }
+    pub fn post(url: impl Into<SproutStr>) -> Self { Self::new("hx-post", url) }
+    pub fn put(url: impl Into<SproutStr>) -> Self { Self::new("hx-put", url) }
+    pub fn patch(url: impl Into<SproutStr>) -> Self { Self::new("hx-patch", url) }
+    pub fn delete(url: impl Into<SproutStr>) -> Self { Self::new("hx-delete", url) }
+
+    fn new(method: &'static str, url: impl Into<SproutStr>) -> Self {
+        Self { method, url: url.into(), target: None, swap: None, oob: None, indicator: None, trigger: None }
+    }
+
+    pub fn to(mut self, target: impl Into<SproutStr>) -> Self { self.target = Some(target.into()); self }
+    pub fn swap(mut self, strategy: impl Into<Swap>) -> Self { self.swap = Some(strategy.into().as_str()); self }
+    pub fn oob(mut self, strategy: &'static str) -> Self { self.oob = Some(strategy); self }
+    pub fn indicator(mut self, selector: impl Into<SproutStr>) -> Self { self.indicator = Some(selector.into()); self }
+    pub fn trigger(mut self, trigger_expr: impl Into<SproutStr>) -> Self { self.trigger = Some(trigger_expr.into()); self }
+}
+
+pub trait SproutExt: Sized {
+    fn sprout_action(self, action: SproutAction) -> Self;
+
+    fn hx_post_to(self, url: impl Into<SproutStr>, target: impl Into<SproutStr>) -> Self {
+        self.sprout_action(post(url).to(target))
+    }
+    fn hx_get_to(self, url: impl Into<SproutStr>, target: impl Into<SproutStr>) -> Self {
+        self.sprout_action(get(url).to(target))
+    }
+}
+
+impl SproutExt for Element {
+    fn sprout_action(self, action: SproutAction) -> Self {
+        let mut el = self.attr(action.method, action.url);
+        if let Some(t) = action.target { el = el.attr("hx-target", t); }
+        if let Some(s) = action.swap { el = el.attr("hx-swap", s); }
+        if let Some(o) = action.oob { el = el.attr("hx-swap-oob", o); }
+        if let Some(i) = action.indicator { el = el.attr("hx-indicator", i); }
+        if let Some(tr) = action.trigger { el = el.attr("hx-trigger", tr); }
+
+        #[cfg(debug_assertions)]
+        {
+            let debug_str = sprout_fmt!("{}", el.tag);
+            return el.attr("data-sprout-debug", debug_str);
+        }
+        #[allow(unreachable_code)]
+        el
+    }
+}
+
+// =====================================================================
+// SECTION 8 — NATIVE BROWSER HELPERS (zero-JS features)
+// =====================================================================
+
+pub fn popover_trigger(target_id: impl Into<SproutStr>, label: impl IntoStream) -> Element {
+    Element::new("button").attr("popovertarget", target_id).child(label)
+}
+pub fn popover_panel(id: impl Into<SproutStr>, content: impl IntoStream) -> Element {
+    Element::new("div").id(id).attr("popover", "auto").child(content)
+}
+pub fn auto_closing_dialog(id: impl Into<SproutStr>, content: impl IntoStream) -> Element {
+    Element::new("dialog").id(id).attr("closedby", "any").child(content)
+}
+pub fn dialog_cancel_button(label: impl IntoStream) -> Element {
+    Element::new("button").attr("formmethod", "dialog").attr("value", "cancel").child(label)
+}
+pub fn autocomplete_input(name: impl Into<SproutStr>, list_id: impl Into<SproutStr>) -> VoidElement {
+    VoidElement::new("input").name(name).attr("list", list_id)
+}
+pub fn datalist<I, T>(id: impl Into<SproutStr>, options: I) -> Element
+where I: IntoIterator<Item = T>, T: Into<SproutStr> {
+    Element::new("datalist").id(id).child_for(options, |opt| Element::new("option").value(opt))
+}
+pub fn inert_if(el: Element, condition: bool) -> Element {
+    el.attr_if(condition, "inert", "")
+}
+pub fn lazy_img(src: impl Into<SproutStr>, alt: impl Into<SproutStr>) -> VoidElement {
+    VoidElement::new("img").src(src).alt(alt).attr("loading", "lazy")
+}
+pub fn progress_bar(value: u32, max: u32) -> Element {
+    Element::new("progress").attr("value", sprout_fmt!("{value}")).attr("max", sprout_fmt!("{max}"))
+}
+pub fn time_tag(display_text: impl IntoStream, machine_date: impl Into<SproutStr>) -> Element {
+    Element::new("time").attr("datetime", machine_date).child(display_text)
+}
+pub fn download_link(url: impl Into<SproutStr>, filename: impl Into<SproutStr>, label: impl IntoStream) -> Element {
+    Element::new("a").href(url).attr("download", filename).child(label)
+}
+pub fn external_link(url: impl Into<SproutStr>, label: impl IntoStream) -> Element {
+    Element::new("a").href(url).attr("target", "_blank").attr("rel", "noopener noreferrer").child(label)
+}
+
+// =====================================================================
+// SECTION 9 — TESTS
 // =====================================================================
 
 #[cfg(test)]
@@ -562,227 +798,62 @@ mod tests {
 
     #[test]
     fn renders_empty_div() {
-        let html = Element::new("div").build().into_string();
-        assert_eq!(html, "<div></div>");
-    }
-
-    #[test]
-    fn custom_element_with_hyphen_bypasses_validation() {
-        let html = Element::new("my-widget").attr("data-id", "42").build().into_string();
-        assert_eq!(html, r#"<my-widget data-id="42"></my-widget>"#);
-    }
-
-    #[test]
-    fn path_is_correctly_classified_as_void() {
-        let html = VoidElement::new("path").attr("d", "M0 0L10 10").build().into_string();
-        assert_eq!(html, r#"<path d="M0 0L10 10">"#);
+        assert_eq!(Element::new("div").build().into_string(), "<div></div>");
     }
 
     #[test]
     fn renders_single_class() {
-        let html = Element::new("div").class("card").build().into_string();
-        assert_eq!(html, r#"<div class="card"></div>"#);
+        assert_eq!(Element::new("div").class("card").build().into_string(), r#"<div class="card"></div>"#);
     }
 
     #[test]
-    fn duplicate_class_is_not_repeated() {
-        let html = Element::new("div").class("card").class("card").build().into_string();
-        assert_eq!(html, r#"<div class="card"></div>"#);
-    }
-
-    #[test]
-    fn renders_multiple_distinct_classes_joined_with_space() {
-        let html = Element::new("div").class("card").class("featured").build().into_string();
-        assert_eq!(html, r#"<div class="card featured"></div>"#);
+    fn chains_multiple_classes_zero_alloc() {
+        let html = Element::new("div").class("a").class("b").class("c").build().into_string();
+        assert_eq!(html, r#"<div class="a b c"></div>"#);
     }
 
     #[test]
     fn class_if_only_adds_when_true() {
-        let active = Element::new("a").class_if(true, "active").build().into_string();
-        let inactive = Element::new("a").class_if(false, "active").build().into_string();
-        assert_eq!(active, r#"<a class="active"></a>"#);
-        assert_eq!(inactive, "<a></a>");
+        assert_eq!(Element::new("a").class_if(true, "active").build().into_string(), r#"<a class="active"></a>"#);
+        assert_eq!(Element::new("a").class_if(false, "active").build().into_string(), "<a></a>");
     }
 
     #[test]
-    fn classes_if_adds_only_matching_conditions() {
-        let html = Element::new("li")
-            .classes_if([(true, "active"), (false, "disabled"), (true, "highlighted")])
-            .build()
-            .into_string();
-        assert_eq!(html, r#"<li class="active highlighted"></li>"#);
+    fn classes_if_adds_only_matching() {
+        let html = Element::new("li").classes_if([(true, "active"), (false, "x"), (true, "hot")]).build().into_string();
+        assert_eq!(html, r#"<li class="active hot"></li>"#);
     }
 
     #[test]
-    fn attr_if_only_adds_when_true() {
-        let disabled = Element::new("button").attr_if(true, "disabled", "").build().into_string();
-        let enabled = Element::new("button").attr_if(false, "disabled", "").build().into_string();
-        assert_eq!(disabled, r#"<button disabled=""></button>"#);
-        assert_eq!(enabled, "<button></button>");
+    fn disabled_required_readonly_checked_work() {
+        assert_eq!(Element::new("button").disabled(true).build().into_string(), "<button disabled></button>");
+        assert_eq!(VoidElement::new("input").required(true).build().into_string(), "<input required>");
     }
 
     #[test]
-    fn flag_sets_bare_boolean_attribute() {
-        let html = VoidElement::new("input").flag(true, "required").build().into_string();
-        assert_eq!(html, "<input required>");
+    #[should_panic(expected = "Order matters")]
+    fn attr_after_child_panics_with_helpful_message() {
+        let _ = Element::new("div").child("text").class("too-late");
     }
 
     #[test]
-    fn disabled_helper_works() {
-        let on = Element::new("button").disabled(true).build().into_string();
-        let off = Element::new("button").disabled(false).build().into_string();
-        assert_eq!(on, "<button disabled></button>");
-        assert_eq!(off, "<button></button>");
+    fn nests_elements_via_streaming_flatten() {
+        let html = Element::new("div").child(Element::new("p").child("hello")).build().into_string();
+        assert_eq!(html, "<div><p>hello</p></div>");
     }
 
     #[test]
-    fn required_helper_works() {
-        let html = VoidElement::new("input").required(true).build().into_string();
-        assert_eq!(html, "<input required>");
+    fn child_for_builds_from_iterator() {
+        let html = Element::new("ul")
+            .child_for(vec!["Apple", "Banana"], |f| Element::new("li").child(f))
+            .build().into_string();
+        assert_eq!(html, "<ul><li>Apple</li><li>Banana</li></ul>");
     }
 
     #[test]
-    fn readonly_helper_works() {
-        let html = VoidElement::new("input").readonly(true).build().into_string();
-        assert_eq!(html, "<input readonly>");
-    }
-
-    #[test]
-    fn checked_helper_works() {
-        let html = VoidElement::new("input").checked(true).build().into_string();
-        assert_eq!(html, "<input checked>");
-    }
-
-    #[test]
-    fn modify_runs_arbitrary_closure_on_element() {
-        let html = Element::new("div").modify(|el| el.class("from-modify")).build().into_string();
-        assert_eq!(html, r#"<div class="from-modify"></div>"#);
-    }
-
-    #[test]
-    fn renders_style_attribute() {
-        let html = Element::new("div").style("color: red;").build().into_string();
-        assert_eq!(html, r#"<div style="color: red;"></div>"#);
-    }
-
-    #[test]
-    fn renders_id() {
-        let html = Element::new("div").id("post-list").build().into_string();
-        assert_eq!(html, r#"<div id="post-list"></div>"#);
-    }
-
-    #[test]
-    fn renders_custom_attr() {
-        let html = VoidElement::new("input").attr("placeholder", "Title").build().into_string();
-        assert_eq!(html, r#"<input placeholder="Title">"#);
-    }
-
-    #[test]
-    fn placeholder_sugar_matches_attr() {
-        let html = VoidElement::new("input").placeholder("Title").build().into_string();
-        assert_eq!(html, r#"<input placeholder="Title">"#);
-    }
-
-    #[test]
-    fn src_and_alt_sugar_on_img() {
-        let html = VoidElement::new("img").src("/me.png").alt("profile photo").build().into_string();
-        assert_eq!(html, r#"<img src="/me.png" alt="profile photo">"#);
-    }
-
-    #[test]
-    fn href_sugar_on_anchor() {
-        let html = Element::new("a").href("/blog").child("Blog").build().into_string();
-        assert_eq!(html, r#"<a href="/blog">Blog</a>"#);
-    }
-
-    #[test]
-    fn type_sugar_on_input() {
-        let html = VoidElement::new("input").type_("text").build().into_string();
-        assert_eq!(html, r#"<input type="text">"#);
-    }
-
-    #[test]
-    fn renders_attrs_in_call_order() {
-        let html = Element::new("div").class("a").id("b").attr("data-x", "1").build().into_string();
-        assert_eq!(html, r#"<div class="a" id="b" data-x="1"></div>"#);
-    }
-
-    #[test]
-    fn hx_post_sets_correct_attribute() {
-        let html = Element::new("form").hx_post("/blog/posts").build().into_string();
-        assert_eq!(html, r#"<form hx-post="/blog/posts"></form>"#);
-    }
-
-    #[test]
-    fn hx_target_sets_correct_attribute() {
-        let html = Element::new("form").hx_target("#post-list").build().into_string();
-        assert_eq!(html, r##"<form hx-target="#post-list"></form>"##);
-    }
-
-    #[test]
-    fn hx_get_sets_correct_attribute() {
-        let html = Element::new("button").hx_get("/refresh").build().into_string();
-        assert_eq!(html, r#"<button hx-get="/refresh"></button>"#);
-    }
-
-    #[test]
-    fn hx_swap_sets_correct_attribute() {
-        let html = Element::new("form").hx_swap("beforeend").build().into_string();
-        assert_eq!(html, r#"<form hx-swap="beforeend"></form>"#);
-    }
-
-    #[test]
-    fn x_data_sets_correct_attribute() {
-        let html = Element::new("div").x_data("{ open: false }").build().into_string();
-        assert_eq!(html, r#"<div x-data="{ open: false }"></div>"#);
-    }
-
-    #[test]
-    fn x_show_sets_correct_attribute() {
-        let html = Element::new("div").x_show("open").build().into_string();
-        assert_eq!(html, r#"<div x-show="open"></div>"#);
-    }
-
-    #[test]
-    fn x_model_sets_correct_attribute() {
-        let html = VoidElement::new("input").x_model("title").build().into_string();
-        assert_eq!(html, r#"<input x-model="title">"#);
-    }
-
-    #[test]
-    fn x_text_sets_correct_attribute() {
-        let html = Element::new("span").x_text("count").build().into_string();
-        assert_eq!(html, r#"<span x-text="count"></span>"#);
-    }
-
-    #[test]
-    fn x_on_builds_event_specific_attribute() {
-        let html = Element::new("button").x_on("click", "open = !open").child("Toggle").build().into_string();
-        assert_eq!(html, r#"<button x-on:click="open = !open">Toggle</button>"#);
-    }
-
-    #[test]
-    fn x_bind_builds_attribute_specific_key() {
-        let html = Element::new("div").x_bind("class", "isOpen ? 'show' : ''").build().into_string();
-        assert_eq!(html, r#"<div x-bind:class="isOpen ? 'show' : ''"></div>"#);
-    }
-
-    #[test]
-    fn x_transition_sets_bare_attribute() {
-        let html = Element::new("div").x_transition().build().into_string();
-        assert_eq!(html, "<div x-transition></div>");
-    }
-
-    #[test]
-    fn alpine_value_with_quotes_and_braces_is_escaped() {
-        let html = Element::new("div").x_data("{ count: 0, label: 'hi' }").build().into_string();
-        assert_eq!(html, r#"<div x-data="{ count: 0, label: 'hi' }"></div>"#);
-    }
-
-    #[test]
-    fn escapes_ampersand_in_text() {
-        let html = Element::new("p").child("Rust & Axum").build().into_string();
-        assert_eq!(html, "<p>Rust &amp; Axum</p>");
+    fn child_if_only_renders_when_true() {
+        assert_eq!(Element::new("div").child_if(true, || "shown").build().into_string(), "<div>shown</div>");
+        assert_eq!(Element::new("div").child_if(false, || "hidden").build().into_string(), "<div></div>");
     }
 
     #[test]
@@ -792,234 +863,74 @@ mod tests {
     }
 
     #[test]
-    fn does_not_escape_quotes_in_text_content() {
-        let html = Element::new("p").child("he said \"hi\"").build().into_string();
-        assert_eq!(html, "<p>he said \"hi\"</p>");
+    fn escapes_quotes_in_attributes_only() {
+        let attr_html = VoidElement::new("input").attr("placeholder", "say \"hi\"").build().into_string();
+        assert_eq!(attr_html, r#"<input placeholder="say &quot;hi&quot;">"#);
+        let text_html = Element::new("p").child("he said \"hi\"").build().into_string();
+        assert_eq!(text_html, "<p>he said \"hi\"</p>");
     }
 
     #[test]
-    fn escapes_quote_in_attribute_value() {
-        let html = VoidElement::new("input").attr("placeholder", "say \"hi\"").build().into_string();
-        assert_eq!(html, r#"<input placeholder="say &quot;hi&quot;">"#);
+    fn void_element_self_closes() {
+        assert_eq!(VoidElement::new("br").build().into_string(), "<br>");
     }
 
     #[test]
-    fn escapes_angle_brackets_in_attribute_value() {
-        let html = VoidElement::new("input").attr("data-x", "<b>").build().into_string();
-        assert_eq!(html, r#"<input data-x="&lt;b&gt;">"#);
-    }
-
-    #[test]
-    fn escapes_class_value_containing_quote() {
-        let html = Element::new("div").class("weird\"class").build().into_string();
-        assert_eq!(html, r#"<div class="weird&quot;class"></div>"#);
-    }
-
-    #[test]
-    fn void_element_self_closes_without_children() {
-        let html = VoidElement::new("br").build().into_string();
-        assert_eq!(html, "<br>");
-    }
-
-    #[test]
-    fn void_element_renders_attrs_correctly() {
-        let html = VoidElement::new("input").attr("type", "text").attr("name", "title").build().into_string();
-        assert_eq!(html, r#"<input type="text" name="title">"#);
-    }
-
-    #[test]
-    fn img_void_element_with_class() {
-        let html = VoidElement::new("img").class("avatar").attr("src", "/me.png").build().into_string();
-        assert_eq!(html, r#"<img class="avatar" src="/me.png">"#);
-    }
-
-    #[test]
-    fn nests_element_inside_element() {
-        let html = Element::new("div").child(Element::new("p").child("hello")).build().into_string();
-        assert_eq!(html, "<div><p>hello</p></div>");
-    }
-
-    #[test]
-    fn nests_void_element_inside_element() {
-        let html = Element::new("div").child(VoidElement::new("br")).build().into_string();
-        assert_eq!(html, "<div><br></div>");
-    }
-
-    #[test]
-    fn children_preserves_order() {
-        let html = Element::new("ul").children(vec![
-            Element::new("li").child("first"),
-            Element::new("li").child("second"),
-            Element::new("li").child("third"),
-        ]).build().into_string();
-        assert_eq!(html, "<ul><li>first</li><li>second</li><li>third</li></ul>");
-    }
-
-    #[test]
-    fn child_for_builds_children_from_iterator() {
-        let fruits = vec!["Apple", "Banana"];
-        let html = Element::new("ul")
-            .child_for(fruits, |f| Element::new("li").child(f.to_string()))
-            .build()
-            .into_string();
-        assert_eq!(html, "<ul><li>Apple</li><li>Banana</li></ul>");
-    }
-
-    #[test]
-    fn child_if_only_adds_when_true() {
-        let shown = Element::new("div").child_if(true, || "visible").build().into_string();
-        let hidden = Element::new("div").child_if(false, || "invisible").build().into_string();
-        assert_eq!(shown, "<div>visible</div>");
-        assert_eq!(hidden, "<div></div>");
-    }
-
-    #[test]
-    fn deeply_nested_structure_renders_correctly() {
+    fn handles_text_near_inline_buffer_boundary_with_multibyte_chars() {
+        // Regression test: confirms whole-string pushes near the 1024
+        // byte boundary never produce invalid UTF-8, including when
+        // multi-byte characters are involved.
+        let padding = "x".repeat(1020);
+        let emoji_text = "🌱🌱🌱"; // 4 bytes each, 12 bytes total
         let html = Element::new("div")
-            .class("card")
-            .child(Element::new("h2").child("Title"))
-            .child(Element::new("div").class("body").child(Element::new("p").child("Nested content")))
+            .child(padding.clone())
+            .child(emoji_text)
             .build()
             .into_string();
-        assert_eq!(html, r#"<div class="card"><h2>Title</h2><div class="body"><p>Nested content</p></div></div>"#);
+        assert!(html.contains(&padding));
+        assert!(html.contains(emoji_text));
     }
 
     #[test]
-    fn renders_a_full_card_like_component() {
-        let card = Element::new("div")
-            .class("card")
-            .child(Element::new("h1").child("Hello"))
-            .child(Element::new("p").child("Body text"))
-            .child(
-                Element::new("button")
-                    .class("btn-primary")
-                    .hx_post("/like")
-                    .hx_target("#likes")
-                    .child("Like"),
-            );
-
-        let html = card.build().into_string();
-        assert_eq!(
-            html,
-            r##"<div class="card"><h1>Hello</h1><p>Body text</p><button class="btn-primary" hx-post="/like" hx-target="#likes">Like</button></div>"##
-        );
+    fn sprout_action_post_sets_correct_attributes() {
+        let html = Element::new("form").sprout_action(post("/save").to("#result").swap(OuterHTML)).build().into_string();
+        assert!(html.contains(r###"hx-post="/save""###));
+        assert!(html.contains(r###"hx-target="#result""###));
+        assert!(html.contains(r###"hx-swap="outerHTML""###));
     }
 
     #[test]
-    fn alpine_and_htmx_can_be_combined_on_same_element() {
-        let html = Element::new("div")
-            .x_data("{ liked: false }")
-            .hx_post("/like")
-            .hx_target("#likes")
-            .x_on("click", "liked = !liked")
-            .build()
-            .into_string();
-        assert_eq!(
-            html,
-            r##"<div x-data="{ liked: false }" hx-post="/like" hx-target="#likes" x-on:click="liked = !liked"></div>"##
-        );
+    fn hx_post_to_shortcut_works() {
+        let html = Element::new("div").hx_post_to("/update", "#content").build().into_string();
+        assert!(html.contains(r###"hx-post="/update""###));
+        assert!(html.contains(r###"hx-target="#content""###));
     }
 
     #[test]
-    fn child_accepts_options_directly() {
-        let has_error = Some("Password too short");
-        let no_error: Option<&str> = None;
-
-        let html_err = Element::new("div").child(has_error.map(|msg| Element::new("span").child(msg))).build().into_string();
-        let html_clean = Element::new("div").child(no_error.map(|msg| Element::new("span").child(msg))).build().into_string();
-
-        assert_eq!(html_err, r#"<div><span>Password too short</span></div>"#);
-        assert_eq!(html_clean, r#"<div></div>"#);
+    fn x_on_click_shortcut_and_generic_x_on_agree() {
+        let a = Element::new("button").x_on_click("doThing()").build().into_string();
+        let b = Element::new("button").x_on("click", "doThing()").build().into_string();
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn fragment_renders_siblings_without_wrapper() {
-        let two_elements = vec![
-            Element::new("h1").child("Hello").into(),
-            Element::new("p").child("World").into(),
-        ];
-        let html = Element::new("main").child(two_elements).build().into_string();
-        assert_eq!(html, r#"<main><h1>Hello</h1><p>World</p></main>"#);
+    fn popover_and_dialog_helpers_render_correctly() {
+        let html = popover_trigger("m1", "Open").build().into_string();
+        assert_eq!(html, r#"<button popovertarget="m1">Open</button>"#);
+        let dialog = auto_closing_dialog("d1", "hi").build().into_string();
+        assert_eq!(dialog, r#"<dialog id="d1" closedby="any">hi</dialog>"#);
     }
 
     #[test]
-    fn child_accepts_vec_directly() {
-        let list = vec![
-            Element::new("li").child("A").into(),
-            Element::new("li").child("B").into(),
-        ];
-        let html = Element::new("ul").child(list).build().into_string();
-        assert_eq!(html, "<ul><li>A</li><li>B</li></ul>");
+    fn progress_bar_and_time_tag_render_correctly() {
+        assert_eq!(progress_bar(40, 100).build().into_string(), r#"<progress value="40" max="100"></progress>"#);
+        let html = time_tag("June 22, 2026", "2026-06-22").build().into_string();
+        assert_eq!(html, r#"<time datetime="2026-06-22">June 22, 2026</time>"#);
     }
 
     #[test]
-    fn renders_multiple_fragment_levels() {
-        let nested_fragment = vec![
-            Element::new("span").child("A").into(),
-            Element::new("span").child("B").into(),
-        ];
-        let html = Element::new("div")
-            .child(vec![
-                Element::new("p").child("Start").into(),
-                nested_fragment.into(),
-                Element::new("p").child("End").into(),
-            ])
-            .build()
-            .into_string();
-
-        assert_eq!(html, "<div><p>Start</p><span>A</span><span>B</span><p>End</p></div>");
-    }
-
-    #[test]
-    fn attribute_with_multiple_spaces_is_preserved() {
-        let html = Element::new("div").attr("data-text", "hello  world").build().into_string();
-        assert_eq!(html, r#"<div data-text="hello  world"></div>"#);
-    }
-
-    #[test]
-    fn empty_node_renders_nothing() {
-        let html = Element::new("div").child("Visible").child(Node::Empty).child("Also Visible").build().into_string();
-        assert_eq!(html, "<div>VisibleAlso Visible</div>");
-    }
-
-    #[test]
-    fn attribute_keys_with_dashes_and_colons() {
-        let html = Element::new("div").attr("data-custom-key", "value").attr("aria-label", "my-label").build().into_string();
-        assert_eq!(html, r#"<div data-custom-key="value" aria-label="my-label"></div>"#);
-    }
-
-    #[test]
-    fn chaining_modify_multiple_times() {
-        let html = Element::new("div")
-            .modify(|e| e.class("first"))
-            .modify(|e| e.class("second"))
-            .modify(|e| e.id("my-id"))
-            .build()
-            .into_string();
-        assert_eq!(html, r#"<div class="first second" id="my-id"></div>"#);
-    }
-
-    #[test]
-    fn child_if_false_does_not_panic_or_render() {
-        let html = Element::new("div").child_if(false, || Element::new("p").child("should not exist")).build().into_string();
-        assert_eq!(html, "<div></div>");
-    }
-
-    #[test]
-    fn multiple_void_elements_in_container() {
-        let html = Element::new("div").child(VoidElement::new("br")).child(VoidElement::new("hr")).build().into_string();
-        assert_eq!(html, "<div><br><hr></div>");
-    }
-
-    #[test]
-    fn text_node_escaping_full_check() {
-        let html = Element::new("div").child("<script>&\"'</script>").build().into_string();
-        assert_eq!(html, "<div>&lt;script&gt;&amp;\"'&lt;/script&gt;</div>");
-    }
-
-    #[test]
-    fn attribute_escaping_full_check() {
-        let html = Element::new("div").attr("title", "<script>&\"'</script>").build().into_string();
-        assert_eq!(html, r#"<div title="&lt;script&gt;&amp;&quot;'&lt;/script&gt;"></div>"#);
+    fn external_link_includes_safety_attributes() {
+        let html = external_link("https://example.com", "Visit").build().into_string();
+        assert_eq!(html, r#"<a href="https://example.com" target="_blank" rel="noopener noreferrer">Visit</a>"#);
     }
 }

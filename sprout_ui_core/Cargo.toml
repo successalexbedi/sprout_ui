@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 maud = "0.26"
-
+smallvec = "1.13"
+owo-colors = "4.0"

@@ -1,0 +1,141 @@
+{
+"dhatFileVersion": 2,
+"mode": "rust-heap",
+"verb": "Allocated",
+"bklt": true,
+"bkacc": false,
+"tu": "µs",
+"Mtu": "s",
+"tuth": 10,
+"cmd": "/data/data/org.smartide.code/files/home/projects/project/sprout_ui/target/release/deps/memory_profile-fc7a04b69b06c4a5 --bench",
+"pid": 17777,
+"tg": 499218,
+"te": 499225,
+"pps": [
+{
+"tb": 448000,
+"tbk": 1000,
+"tl": 430552,
+"mb": 448,
+"mbk": 1,
+"gb": 448,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+2
+]
+},
+{
+"tb": 96000,
+"tbk": 1000,
+"tl": 326191,
+"mb": 96,
+"mbk": 1,
+"gb": 96,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+3,
+4,
+5,
+6
+]
+},
+{
+"tb": 448000,
+"tbk": 1000,
+"tl": 267381,
+"mb": 448,
+"mbk": 1,
+"gb": 448,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+7
+]
+},
+{
+"tb": 256000,
+"tbk": 1000,
+"tl": 11486,
+"mb": 256,
+"mbk": 1,
+"gb": 256,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+8
+]
+},
+{
+"tb": 96000,
+"tbk": 1000,
+"tl": 174478,
+"mb": 96,
+"mbk": 1,
+"gb": 96,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+3,
+4,
+5,
+9
+]
+},
+{
+"tb": 448000,
+"tbk": 1000,
+"tl": 119253,
+"mb": 448,
+"mbk": 1,
+"gb": 448,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+10
+]
+},
+{
+"tb": 448000,
+"tbk": 1000,
+"tl": 65735,
+"mb": 448,
+"mbk": 1,
+"gb": 448,
+"gbk": 1,
+"eb": 0,
+"ebk": 0,
+"fs": [
+1,
+11
+]
+}
+],
+"ftbl": [
+"[root]",
+"0x730e120024: <dhat::Alloc as core::alloc::global::GlobalAlloc>::alloc (???:0:0)",
+"0x730e0f3b30: memory_profile::main (???:0:0)",
+"0x730e135294: alloc::raw_vec::RawVecInner<A>::finish_grow (???:0:0)",
+"0x730e1351ec: alloc::raw_vec::RawVecInner<A>::grow_amortized (???:0:0)",
+"0x730e135160: alloc::raw_vec::RawVec<T,A>::grow_one (???:0:0)",
+"0x730e0f3bbc: memory_profile::main (???:0:0)",
+"0x730e0f3c50: memory_profile::main (???:0:0)",
+"0x730e0f3fa8: memory_profile::main (???:0:0)",
+"0x730e0f3ce0: memory_profile::main (???:0:0)",
+"0x730e0f3d4c: memory_profile::main (???:0:0)",
+"0x730e0f3e3c: memory_profile::main (???:0:0)"
+]
+}

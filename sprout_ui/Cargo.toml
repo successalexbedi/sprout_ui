@@ -9,9 +9,16 @@ sprout_ui_core = { path = "../sprout_ui_core" }
 sprout_ui_tags = { path = "../sprout_ui_tags" }
 sprout_ui_components = { path = "../sprout_ui_components" }
 
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+dhat = "0.3"
+
 
 [[bench]]
-name = "ui_bench"
+name = "ui_bench" # Your existing Criterion file
+harness = false
+
+[[bench]]
+name = "memory_profile" # Your new Dhat file
 harness = false
